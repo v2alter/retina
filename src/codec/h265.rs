@@ -1,4 +1,4 @@
-// Copyright (C) 2024 Scott Lamb <slamb@slamb.org>
+// Copyright (C) The Retina Authors
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
 //! [H.265](https://www.itu.int/rec/T-REC-H.265)-encoded video,
@@ -56,6 +56,9 @@ pub(crate) struct Depacketizer {
     /// True if we've seen a FU sequence where the NAL headers differ between
     /// fragments.
     seen_inconsistent_fu_nal_hdr: bool,
+
+    /// Output format controlling NAL framing and parameter set insertion.
+    frame_format: super::FrameFormat,
 }
 
 #[derive(Debug)]
@@ -149,7 +152,30 @@ impl Depacketizer {
             nals: Vec::new(),
             parameters,
             seen_inconsistent_fu_nal_hdr: false,
+            frame_format: Default::default(),
         })
+    }
+
+    /// Sets the frame format for output assembly.
+    ///
+    /// If existing parameters were parsed with a different framing, they are
+    /// re-parsed to produce the correct `extra_data` format.
+    pub(super) fn set_frame_format(&mut self, format: super::FrameFormat) {
+        self.frame_format = format;
+
+        // Re-parse existing parameters so extra_data matches the new framing.
+        if let Some(ref ip) = self.parameters {
+            self.parameters = Some(
+                InternalParameters::parse_vps_sps_pps(
+                    &ip.vps_nal,
+                    &ip.sps_nal,
+                    &ip.pps_nal,
+                    ip.seen_extra_trailing_data,
+                    format.h26x_framing,
+                )
+                .expect("re-parse of previously valid VPS/SPS/PPS should not fail"),
+            );
+        }
     }
 
     pub(super) fn check_invariants(&self) {
@@ -483,6 +509,8 @@ impl Depacketizer {
     }
 
     fn finalize_access_unit(&mut self, au: AccessUnit, reason: &str) -> Result<VideoFrame, String> {
+        use super::{ParameterSetInsertion, h26x::Framing};
+
         let mut piece_idx = 0;
         let mut retained_len = 0usize;
 
@@ -541,31 +569,19 @@ impl Depacketizer {
                 }
                 _ => {}
             }
-            retained_len += 4usize + crate::to_usize(nal.len);
-            piece_idx = next_piece_idx;
-        }
-        let mut data = Vec::with_capacity(retained_len);
-        piece_idx = 0;
-        for nal in &self.nals {
-            let next_piece_idx = crate::to_usize(nal.next_piece_idx);
-            let nal_pieces = &self.pieces[piece_idx..next_piece_idx];
-
-            data.extend_from_slice(&nal.len.to_be_bytes());
-            data.extend_from_slice(&nal.hdr[..]);
-
-            let mut actual_len = 2;
-            for piece in nal_pieces {
-                data.extend_from_slice(&piece[..]);
-                actual_len += piece.len();
+            // Always strip inline parameter sets; they're handled via
+            // ParameterSetInsertion and the canonical copy in self.parameters.
+            if !matches!(
+                nal.hdr.unit_type(),
+                nal::UnitType::VpsNut | nal::UnitType::SpsNut | nal::UnitType::PpsNut
+            ) {
+                retained_len += 4usize + crate::to_usize(nal.len);
             }
-            debug_assert_eq!(crate::to_usize(nal.len), actual_len);
             piece_idx = next_piece_idx;
         }
-        debug_assert_eq!(retained_len, data.len());
 
-        self.nals.clear();
-        self.pieces.clear();
-
+        // Update parameters before building the frame, so prepended params
+        // reflect the latest VPS/SPS/PPS.
         // TODO: simpler if we require all or none to be set?
         // although only one could be different.
         let all_new_params = new_vps.is_some() && new_sps.is_some() && new_pps.is_some();
@@ -589,11 +605,69 @@ impl Depacketizer {
                 sps_nal,
                 pps_nal,
                 seen_extra_trailing_data,
+                self.frame_format.h26x_framing,
             )?);
             true
         } else {
             false
         };
+
+        // Determine whether to prepend parameter sets.
+        let prepend_params = is_random_access_point
+            && match self.frame_format.parameter_set_insertion {
+                ParameterSetInsertion::EachKeyFrame => true,
+                ParameterSetInsertion::OnChange => has_new_parameters,
+                ParameterSetInsertion::Never => false,
+            };
+        if prepend_params && let Some(ref p) = self.parameters {
+            // 4-byte prefix + VPS + 4-byte prefix + SPS + 4-byte prefix + PPS
+            retained_len += 4 + p.vps_nal.len() + 4 + p.sps_nal.len() + 4 + p.pps_nal.len();
+        }
+
+        let mut data = Vec::with_capacity(retained_len);
+
+        // Prepend parameter sets if requested.
+        if prepend_params && let Some(ref p) = self.parameters {
+            for param_nal in [&p.vps_nal, &p.sps_nal, &p.pps_nal] {
+                let prefix = match self.frame_format.h26x_framing {
+                    Framing::FourByteLength => (param_nal.len() as u32).to_be_bytes(),
+                    Framing::AnnexB => super::h26x::ANNEX_B_START_CODE,
+                };
+                data.extend_from_slice(&prefix);
+                data.extend_from_slice(param_nal);
+            }
+        }
+
+        // Write non-parameter-set NALs with the configured framing.
+        piece_idx = 0;
+        for nal in &self.nals {
+            let next_piece_idx = crate::to_usize(nal.next_piece_idx);
+            let nal_pieces = &self.pieces[piece_idx..next_piece_idx];
+
+            if !matches!(
+                nal.hdr.unit_type(),
+                nal::UnitType::VpsNut | nal::UnitType::SpsNut | nal::UnitType::PpsNut
+            ) {
+                let prefix = match self.frame_format.h26x_framing {
+                    Framing::FourByteLength => nal.len.to_be_bytes(),
+                    Framing::AnnexB => super::h26x::ANNEX_B_START_CODE,
+                };
+                data.extend_from_slice(&prefix);
+                data.extend_from_slice(&nal.hdr[..]);
+
+                let mut actual_len = 2;
+                for piece in nal_pieces {
+                    data.extend_from_slice(&piece[..]);
+                    actual_len += piece.len();
+                }
+                debug_assert_eq!(crate::to_usize(nal.len), actual_len);
+            }
+            piece_idx = next_piece_idx;
+        }
+        debug_assert_eq!(retained_len, data.len());
+
+        self.nals.clear();
+        self.pieces.clear();
 
         Ok(VideoFrame {
             has_new_parameters,
@@ -728,7 +802,13 @@ impl InternalParameters {
         let vps_nal = vps_nal.ok_or_else(|| "no vps".to_string())?;
         let sps_nal = sps_nal.ok_or_else(|| "no sps".to_string())?;
         let pps_nal = pps_nal.ok_or_else(|| "no pps".to_string())?;
-        Self::parse_vps_sps_pps(&vps_nal, &sps_nal, &pps_nal, false)
+        Self::parse_vps_sps_pps(
+            &vps_nal,
+            &sps_nal,
+            &pps_nal,
+            false,
+            super::h26x::Framing::FourByteLength,
+        )
     }
 
     fn store_sprop_nal(key: &str, value: &str, out: &mut Option<Vec<u8>>) -> Result<(), String> {
@@ -750,6 +830,7 @@ impl InternalParameters {
         sps_nal: &[u8],
         pps_nal: &[u8],
         mut seen_extra_trailing_data: bool,
+        framing: super::h26x::Framing,
     ) -> Result<InternalParameters, String> {
         let (vps_h, _vps_bits) =
             nal::split(vps_nal).map_err(|e| format!("failed to parse VPS: {e}"))?;
@@ -799,17 +880,7 @@ impl InternalParameters {
 
         let rfc6381_codec = sps.rfc6381_codec();
 
-        let pixel_dimensions = sps.pixel_dimensions()?;
-        let e = |_| {
-            format!(
-                "SPS has invalid pixel dimensions: {}x{} is too large",
-                pixel_dimensions.0, pixel_dimensions.1
-            )
-        };
-        let pixel_dimensions = (
-            u16::try_from(pixel_dimensions.0).map_err(e)?,
-            u16::try_from(pixel_dimensions.1).map_err(e)?,
-        );
+        let all_pixel_dimensions = sps.all_pixel_dimensions()?;
         let (pixel_aspect_ratio, frame_rate);
         if let Some(v) = sps.vui() {
             pixel_aspect_ratio = v
@@ -824,24 +895,59 @@ impl InternalParameters {
             frame_rate = None;
         }
 
-        let hevc_decoder_config =
-            record::decoder_configuration_record(pps_nal, &pps, sps_nal, &sps, vps_nal);
+        let (extra_data, vps_nal_b, sps_nal_b, pps_nal_b) = match framing {
+            super::h26x::Framing::FourByteLength => {
+                let hevc_decoder_config =
+                    record::decoder_configuration_record(pps_nal, &pps, sps_nal, &sps, vps_nal);
+                (
+                    hevc_decoder_config.record,
+                    hevc_decoder_config.vps,
+                    hevc_decoder_config.sps,
+                    hevc_decoder_config.pps,
+                )
+            }
+            super::h26x::Framing::AnnexB => {
+                // Annex B: start code prefix + VPS + start code prefix + SPS + start code prefix + PPS.
+                let mut buf = bytes::BytesMut::with_capacity(
+                    12 + vps_nal.len() + sps_nal.len() + pps_nal.len(),
+                );
+                buf.extend_from_slice(&super::h26x::ANNEX_B_START_CODE);
+                let vps_start = buf.len();
+                buf.extend_from_slice(vps_nal);
+                let vps_end = buf.len();
+                buf.extend_from_slice(&super::h26x::ANNEX_B_START_CODE);
+                let sps_start = buf.len();
+                buf.extend_from_slice(sps_nal);
+                let sps_end = buf.len();
+                buf.extend_from_slice(&super::h26x::ANNEX_B_START_CODE);
+                let pps_start = buf.len();
+                buf.extend_from_slice(pps_nal);
+                let pps_end = buf.len();
+                let buf = buf.freeze();
+                (
+                    buf.clone(),
+                    buf.slice(vps_start..vps_end),
+                    buf.slice(sps_start..sps_end),
+                    buf.slice(pps_start..pps_end),
+                )
+            }
+        };
         Ok(InternalParameters {
             generic_parameters: super::VideoParameters {
                 rfc6381_codec,
-                pixel_dimensions,
+                all_pixel_dimensions,
                 pixel_aspect_ratio,
                 frame_rate,
-                extra_data: hevc_decoder_config.record,
+                extra_data,
                 codec: super::VideoParametersCodec::H265 {
-                    sps: hevc_decoder_config.sps.clone(),
-                    pps: hevc_decoder_config.pps.clone(),
-                    vps: hevc_decoder_config.vps.clone(),
+                    sps: sps_nal_b.clone(),
+                    pps: pps_nal_b.clone(),
+                    vps: vps_nal_b.clone(),
                 },
             },
-            vps_nal: hevc_decoder_config.vps,
-            sps_nal: hevc_decoder_config.sps,
-            pps_nal: hevc_decoder_config.pps,
+            vps_nal: vps_nal_b,
+            sps_nal: sps_nal_b,
+            pps_nal: pps_nal_b,
             seen_extra_trailing_data,
         })
     }
@@ -893,6 +999,10 @@ mod tests {
     fn depacketize() {
         init_logging();
         let mut d = super::Depacketizer::new(90_000, Some("profile-id=1;sprop-sps=QgEBAWAAAAMAsAAAAwAAAwBaoAWCAeFja5JFL83BQYFBAAADAAEAAAMADKE=;sprop-pps=RAHA8saNA7NA;sprop-vps=QAEMAf//AWAAAAMAsAAAAwAAAwBarAwAAAMABAAAAwAyqA==")).unwrap();
+        d.set_frame_format(crate::codec::FrameFormat {
+            parameter_set_insertion: crate::codec::ParameterSetInsertion::Never,
+            ..Default::default()
+        });
         let timestamp = crate::Timestamp {
             timestamp: 0,
             clock_rate: NonZeroU32::new(90_000).unwrap(),
@@ -995,6 +1105,159 @@ mod tests {
               \x00\x00\x00\x1d\x28\x01fu start, fu middle, fu end"
         );
         assert!(!d.seen_inconsistent_fu_nal_hdr);
+    }
+
+    /// Tests that inline VPS/SPS/PPS NALs are stripped when `strip_inline_parameters` is true,
+    /// and retained by default.
+    ///
+    /// The VPS/SPS/PPS bytes are sent as single-NAL RTP packets, matching the sprop parameters
+    /// used to initialize the depacketizer (so no re-parse is triggered). An IDR_W_RADL (type 19)
+    /// closes the access unit.
+    #[test]
+    fn depacketize_strip_inline_parameters() {
+        init_logging();
+        use base64::Engine as _;
+        let b64 = base64::engine::general_purpose::STANDARD;
+
+        // These VPS/SPS/PPS bytes match the sprop parameters in the depacketize test.
+        let vps_nal = b64
+            .decode("QAEMAf//AWAAAAMAsAAAAwAAAwBarAwAAAMABAAAAwAyqA==")
+            .unwrap();
+        let sps_nal = b64
+            .decode("QgEBAWAAAAMAsAAAAwAAAwBaoAWCAeFja5JFL83BQYFBAAADAAEAAAMADKE=")
+            .unwrap();
+        let pps_nal = b64.decode("RAHA8saNA7NA").unwrap();
+        // IDR_W_RADL NAL (type 19, 0x26; byte 0): \x26\x01 + data
+        let idr_nal: &[u8] = b"\x26\x01idr";
+
+        let sprop = "profile-id=1;sprop-sps=QgEBAWAAAAMAsAAAAwAAAwBaoAWCAeFja5JFL83BQYFBAAADAAEAAAMADKE=;sprop-pps=RAHA8saNA7NA;sprop-vps=QAEMAf//AWAAAAMAsAAAAwAAAwBarAwAAAMABAAAAwAyqA==";
+        let timestamp = crate::Timestamp {
+            timestamp: 0,
+            clock_rate: NonZeroU32::new(90_000).unwrap(),
+            start: 0,
+        };
+
+        let push_pkts = |d: &mut super::Depacketizer| {
+            // VPS (mark=false: parameter sets can't end an AU).
+            d.push(
+                ReceivedPacketBuilder {
+                    ctx: PacketContext::dummy(),
+                    stream_id: 0,
+                    timestamp,
+                    ssrc: 0,
+                    sequence_number: 0,
+                    loss: 0,
+                    mark: false,
+                    payload_type: 0,
+                }
+                .build(vps_nal.clone())
+                .unwrap(),
+            )
+            .unwrap();
+            assert_eq!(d.pull(), None);
+            // SPS
+            d.push(
+                ReceivedPacketBuilder {
+                    ctx: PacketContext::dummy(),
+                    stream_id: 0,
+                    timestamp,
+                    ssrc: 0,
+                    sequence_number: 1,
+                    loss: 0,
+                    mark: false,
+                    payload_type: 0,
+                }
+                .build(sps_nal.clone())
+                .unwrap(),
+            )
+            .unwrap();
+            assert_eq!(d.pull(), None);
+            // PPS
+            d.push(
+                ReceivedPacketBuilder {
+                    ctx: PacketContext::dummy(),
+                    stream_id: 0,
+                    timestamp,
+                    ssrc: 0,
+                    sequence_number: 2,
+                    loss: 0,
+                    mark: false,
+                    payload_type: 0,
+                }
+                .build(pps_nal.clone())
+                .unwrap(),
+            )
+            .unwrap();
+            assert_eq!(d.pull(), None);
+            // IDR_W_RADL (mark=true: ends the access unit).
+            d.push(
+                ReceivedPacketBuilder {
+                    ctx: PacketContext::dummy(),
+                    stream_id: 0,
+                    timestamp,
+                    ssrc: 0,
+                    sequence_number: 3,
+                    loss: 0,
+                    mark: true,
+                    payload_type: 0,
+                }
+                .build(idr_nal.iter().copied())
+                .unwrap(),
+            )
+            .unwrap();
+        };
+
+        // Without stripping: VPS/SPS/PPS are included in frame data.
+        {
+            let mut d = super::Depacketizer::new(90_000, Some(sprop)).unwrap();
+            push_pkts(&mut d);
+            let frame = match d.pull() {
+                Some(Ok(CodecItem::VideoFrame(frame))) => frame,
+                o => panic!("{o:#?}"),
+            };
+            let expected_len = (4 + vps_nal.len())
+                + (4 + sps_nal.len())
+                + (4 + pps_nal.len())
+                + (4 + idr_nal.len());
+            assert_eq!(
+                frame.data().len(),
+                expected_len,
+                "without stripping, all NALs including VPS/SPS/PPS should be in output"
+            );
+        }
+
+        // With stripping: only the IDR NAL is in frame data.
+        {
+            let mut d = super::Depacketizer::new(90_000, Some(sprop)).unwrap();
+            d.set_frame_format(crate::codec::FrameFormat::MP4);
+            push_pkts(&mut d);
+            let frame = match d.pull() {
+                Some(Ok(CodecItem::VideoFrame(frame))) => frame,
+                o => panic!("{o:#?}"),
+            };
+            let mut expected = Vec::new();
+            expected.extend_from_slice(&(idr_nal.len() as u32).to_be_bytes());
+            expected.extend_from_slice(idr_nal);
+            // Only IDR NAL: 4-byte length prefix + idr_nal bytes.
+            assert_eq_hex!(frame.data(), &expected);
+        }
+
+        // SIMPLE mode (Annex B framing, parameter sets prepended on each key frame).
+        {
+            let mut d = super::Depacketizer::new(90_000, Some(sprop)).unwrap();
+            d.set_frame_format(crate::codec::FrameFormat::SIMPLE);
+            push_pkts(&mut d);
+            let frame = match d.pull() {
+                Some(Ok(CodecItem::VideoFrame(frame))) => frame,
+                o => panic!("{o:#?}"),
+            };
+            let mut expected = Vec::new();
+            for nal in [&*vps_nal, &*sps_nal, &*pps_nal, idr_nal] {
+                expected.extend_from_slice(&super::super::h26x::ANNEX_B_START_CODE);
+                expected.extend_from_slice(nal);
+            }
+            assert_eq_hex!(frame.data(), &expected);
+        }
     }
 
     #[test]

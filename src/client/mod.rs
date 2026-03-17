@@ -1,4 +1,4 @@
-// Copyright (C) 2021 Scott Lamb <slamb@slamb.org>
+// Copyright (C) The Retina Authors
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
 //! RTSP client: connect to a server via [`Session`].
@@ -10,15 +10,16 @@ use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::num::NonZeroU32;
 use std::sync::{Arc, Mutex};
 use std::task::Poll;
+use std::time::Instant;
 use std::{fmt::Debug, num::NonZeroU16, pin::Pin};
 
 use self::channel_mapping::*;
 pub use self::timeline::Timeline;
+use crate::rtsp::msg::{self as msg, OwnedMessage, StatusCode};
 use bytes::Bytes;
 use futures::{Future, SinkExt, StreamExt, ready};
 use log::{debug, trace, warn};
 use pin_project::pin_project;
-use rtsp_types::{Data, Method};
 use tokio::net::UdpSocket;
 use tokio::sync::Notify;
 use url::Url;
@@ -280,7 +281,7 @@ impl SessionGroup {
 /// Policy for when to send `TEARDOWN` requests.
 ///
 /// Specify via [`SessionOptions::teardown`].
-#[derive(Copy, Clone, Debug, Default)]
+#[derive(Copy, Clone, Debug, Default, derive_more::Display)]
 pub enum TeardownPolicy {
     /// Automatic.
     ///
@@ -296,26 +297,19 @@ pub enum TeardownPolicy {
     ///     to be buggy but don't advertise buggy versions. After the single attempt,
     ///     closes the TCP connection and considers the session done.
     #[default]
+    #[display("auto")]
     Auto,
 
     /// Always send `TEARDOWN` requests, regardless of transport.
     ///
     /// This tries repeatedly to tear down the session until success or expiration;
     /// [`SessionGroup`] will track it also.
+    #[display("always")]
     Always,
 
     /// Never send `TEARDOWN` or track stale sessions.
+    #[display("never")]
     Never,
-}
-
-impl std::fmt::Display for TeardownPolicy {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.pad(match self {
-            TeardownPolicy::Auto => "auto",
-            TeardownPolicy::Never => "never",
-            TeardownPolicy::Always => "always",
-        })
-    }
 }
 
 impl std::str::FromStr for TeardownPolicy {
@@ -336,37 +330,30 @@ impl std::str::FromStr for TeardownPolicy {
 /// Policy for handling the `rtptime` parameter normally seen in the `RTP-Info` header.
 /// This parameter is used to map each stream's RTP timestamp to NPT ("normal play time"),
 /// allowing multiple streams to be played in sync.
-#[derive(Copy, Clone, Debug, Default)]
+#[derive(Copy, Clone, Debug, Default, derive_more::Display)]
 pub enum InitialTimestampPolicy {
     /// Default policy: currently `Require` when playing multiple streams,
     /// `Ignore` otherwise.
     #[default]
+    #[display("default")]
     Default,
 
     /// Require the `rtptime` parameter be present and use it to set NPT. Use
     /// when accurate multi-stream NPT is important.
+    #[display("require")]
     Require,
 
     /// Ignore the `rtptime` parameter and assume the first received packet for
     /// each stream is at NPT 0. Use with cameras that are known to set
     /// `rtptime` incorrectly.
+    #[display("ignore")]
     Ignore,
 
     /// Use the `rtptime` parameter when playing multiple streams if it's
     /// specified for all of them; otherwise assume the first received packet
     /// for each stream is at NPT 0.
+    #[display("permissive")]
     Permissive,
-}
-
-impl std::fmt::Display for InitialTimestampPolicy {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.pad(match self {
-            InitialTimestampPolicy::Default => "default",
-            InitialTimestampPolicy::Require => "require",
-            InitialTimestampPolicy::Ignore => "ignore",
-            InitialTimestampPolicy::Permissive => "permissive",
-        })
-    }
 }
 
 impl std::str::FromStr for InitialTimestampPolicy {
@@ -387,14 +374,16 @@ impl std::str::FromStr for InitialTimestampPolicy {
 }
 
 /// Policy for handling the `seq` parameter normally seen in the `RTP-Info` header.
-#[derive(Copy, Clone, Debug, Default)]
+#[derive(Copy, Clone, Debug, Default, derive_more::Display)]
 #[non_exhaustive]
 pub enum InitialSequenceNumberPolicy {
     /// Default policy: currently same as `IgnoreSuspiciousValues`.
     #[default]
+    #[display("default")]
     Default,
 
     /// Always respect the value in the header if present.
+    #[display("respect")]
     Respect,
 
     /// Ignore `0` and `1` values, which we consider "suspicious".
@@ -405,21 +394,12 @@ pub enum InitialSequenceNumberPolicy {
     /// *   The Hikvision DS-2CD2032-I appears to always send `seq=0` on its
     ///     metadata stream.
     /// *   The Tapo C320WS appears to always send `seq=1` in all streams.
+    #[display("ignore-suspicious-values")]
     IgnoreSuspiciousValues,
 
     /// Always ignore, starting the sequence number from observed RTP packets.
+    #[display("ignore")]
     Ignore,
-}
-
-impl std::fmt::Display for InitialSequenceNumberPolicy {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.pad(match self {
-            InitialSequenceNumberPolicy::Default => "default",
-            InitialSequenceNumberPolicy::Respect => "respect",
-            InitialSequenceNumberPolicy::IgnoreSuspiciousValues => "ignore-suspicious-values",
-            InitialSequenceNumberPolicy::Ignore => "ignore",
-        })
-    }
 }
 
 impl std::str::FromStr for InitialSequenceNumberPolicy {
@@ -440,32 +420,25 @@ impl std::str::FromStr for InitialSequenceNumberPolicy {
 }
 
 /// Policy for handling unknown `ssrc` value in RTCP messages.
-#[derive(Copy, Clone, Debug, Default)]
+#[derive(Copy, Clone, Debug, Default, derive_more::Display)]
 #[non_exhaustive]
 pub enum UnknownRtcpSsrcPolicy {
     /// Default policy: currently same as `DropPackets`.
     #[default]
+    #[display("default")]
     Default,
 
     /// Abort the session on encountering an unknown `ssrc`.
+    #[display("abort-session")]
     AbortSession,
 
     /// Drop RTCP packets with an unknown `ssrc`.
+    #[display("drop-packets")]
     DropPackets,
 
     /// Process the packets as if they had the expected `ssrc`.
+    #[display("process-packets")]
     ProcessPackets,
-}
-
-impl std::fmt::Display for UnknownRtcpSsrcPolicy {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.pad(match self {
-            UnknownRtcpSsrcPolicy::Default => "default",
-            UnknownRtcpSsrcPolicy::AbortSession => "abort-session",
-            UnknownRtcpSsrcPolicy::DropPackets => "drop-packets",
-            UnknownRtcpSsrcPolicy::ProcessPackets => "process-packets",
-        })
-    }
 }
 
 impl std::str::FromStr for UnknownRtcpSsrcPolicy {
@@ -508,7 +481,7 @@ pub struct SessionOptions {
 }
 
 /// Policy for handling data received on unassigned RTSP interleaved channels.
-#[derive(Copy, Clone, Default)]
+#[derive(Copy, Clone, Default, derive_more::Display)]
 pub enum UnassignedChannelDataPolicy {
     /// Automatic (default).
     ///
@@ -520,6 +493,7 @@ pub enum UnassignedChannelDataPolicy {
     ///     no tool attribute, or if it does not match the known pattern),
     ///     use `Ignore`.
     #[default]
+    #[display("auto")]
     Auto,
 
     /// Assume the data is due to the live555 stale TCP session bug described
@@ -527,9 +501,11 @@ pub enum UnassignedChannelDataPolicy {
     ///
     /// This session will return error, and the `SessionGroup` will track the
     /// expiration of a stale session.
+    #[display("assume-stale-session")]
     AssumeStaleSession,
 
     /// Returns an error.
+    #[display("error")]
     Error,
 
     /// Ignores the data.
@@ -538,18 +514,8 @@ pub enum UnassignedChannelDataPolicy {
     /// to interleaved channels. If there is no `SETUP` for that stream before
     /// `PLAY`, they will send data anyway, on this channel. In this mode, such
     /// data messages are ignored.
+    #[display("ignore")]
     Ignore,
-}
-
-impl std::fmt::Display for UnassignedChannelDataPolicy {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.pad(match self {
-            UnassignedChannelDataPolicy::Auto => "auto",
-            UnassignedChannelDataPolicy::AssumeStaleSession => "assume-stale-session",
-            UnassignedChannelDataPolicy::Error => "error",
-            UnassignedChannelDataPolicy::Ignore => "ignore",
-        })
-    }
 }
 
 impl std::str::FromStr for UnassignedChannelDataPolicy {
@@ -571,29 +537,22 @@ impl std::str::FromStr for UnassignedChannelDataPolicy {
 
 /// Policy for handling the session ID returned by the server in response to
 /// `SETUP` requests.
-#[derive(Copy, Clone, Debug, Default)]
+#[derive(Copy, Clone, Debug, Default, derive_more::Display)]
 pub enum SessionIdPolicy {
     /// Default policy: currently `RequireMatch`.
     #[default]
+    #[display("default")]
     Default,
 
     /// Requires the server to return the same session ID for all `SETUP`
     /// requests in the session.
+    #[display("require-match")]
     RequireMatch,
 
     /// Uses the session ID returned from the first `SETUP` request and ignores
     /// any subsequent changes. Required for some broken cameras.
+    #[display("use-first")]
     UseFirst,
-}
-
-impl std::fmt::Display for SessionIdPolicy {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.pad(match self {
-            SessionIdPolicy::Default => "default",
-            SessionIdPolicy::RequireMatch => "require-match",
-            SessionIdPolicy::UseFirst => "use-first",
-        })
-    }
 }
 
 impl std::str::FromStr for SessionIdPolicy {
@@ -615,10 +574,11 @@ impl std::str::FromStr for SessionIdPolicy {
 /// The RTP packet transport to request.
 ///
 /// Defaults to `Transport::Tcp`.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, derive_more::Display)]
 #[non_exhaustive]
 pub enum Transport {
     /// Sends RTP packets over the RTSP TCP connection via interleaved data.
+    #[display("tcp")]
     Tcp(TcpTransportOptions),
 
     /// Sends RTP packets over UDP (experimental).
@@ -628,21 +588,13 @@ pub enum Transport {
     /// *   There's no support for sending RTCP RRs (receiver reports), so
     ///     servers won't have the correct information to measure packet loss
     ///     and pace packets appropriately.
+    #[display("udp")]
     Udp(UdpTransportOptions),
 }
 
 impl Default for Transport {
     fn default() -> Self {
         Transport::Tcp(TcpTransportOptions::default())
-    }
-}
-
-impl std::fmt::Display for Transport {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.pad(match self {
-            Transport::Tcp(_) => "tcp",
-            Transport::Udp(_) => "udp",
-        })
     }
 }
 
@@ -710,13 +662,11 @@ impl SessionOptions {
     }
 }
 
-/// Per-stream options decided for `SETUP` time, for future expansion.
-///
-/// There's nothing here yet. Likely in the future this will allow configuring
-/// the output format for H.264 (Annex B or not).
+/// Per-stream options decided at `SETUP` time.
 #[derive(Default)]
 pub struct SetupOptions {
     transport: Transport,
+    frame_format: Option<crate::codec::FrameFormat>,
 }
 
 impl SetupOptions {
@@ -724,6 +674,17 @@ impl SetupOptions {
     #[inline]
     pub fn transport(mut self, transport: Transport) -> Self {
         self.transport = transport;
+        self
+    }
+
+    /// Sets the frame format for output assembly.
+    ///
+    /// This controls H.26x NAL framing (length-prefixed vs Annex B) and
+    /// parameter set insertion. See [`crate::codec::FrameFormat`] for details
+    /// and preset constants like [`FrameFormat::MP4`](crate::codec::FrameFormat::MP4).
+    #[inline]
+    pub fn frame_format(mut self, format: crate::codec::FrameFormat) -> Self {
+        self.frame_format = Some(format);
         self
     }
 }
@@ -954,6 +915,10 @@ impl Stream {
     /// Thus, it's unspecified whether a `parameters` call immediately after `Session::describe`
     /// will return `Some` or `None`.
     ///
+    /// Additionally, parameters obtained before [`Session::setup`](crate::client::Session::setup)
+    /// always use the default framing. After `setup`, parameters reflect the supplied
+    /// [`SetupOptions::frame_format`](crate::client::SetupOptions::frame_format).
+    ///
     /// # With [`Demuxed`]
     ///
     /// When using [`Demuxed`]'s frame-by-frame `futures::Stream` impl, `parameters` reflects
@@ -1065,12 +1030,12 @@ enum KeepaliveMethod {
     GetParameter,
 }
 
-impl From<KeepaliveMethod> for rtsp_types::Method {
+impl From<KeepaliveMethod> for msg::Method {
     fn from(method: KeepaliveMethod) -> Self {
         match method {
-            KeepaliveMethod::Options => rtsp_types::Method::Options,
-            KeepaliveMethod::SetParameter => rtsp_types::Method::SetParameter,
-            KeepaliveMethod::GetParameter => rtsp_types::Method::GetParameter,
+            KeepaliveMethod::Options => msg::Method::OPTIONS,
+            KeepaliveMethod::SetParameter => msg::Method::SET_PARAMETER,
+            KeepaliveMethod::GetParameter => msg::Method::GET_PARAMETER,
         }
     }
 }
@@ -1155,7 +1120,7 @@ struct SessionInner {
     // matter if the stream is setup and the caller wants depacketization.
     describe_ctx: RtspMessageContext,
     describe_cseq: u32,
-    describe_status: rtsp_types::StatusCode,
+    describe_status: StatusCode,
 
     /// The state of the keepalive request; only used in state `Playing`.
     keepalive_state: KeepaliveState,
@@ -1234,16 +1199,13 @@ impl RtspConnection {
         options: &SessionOptions,
         tool: Option<&Tool>,
         requested_auth: &mut Option<http_auth::PasswordClient>,
-        req: &mut rtsp_types::Request<Bytes>,
-    ) -> Result<(RtspMessageContext, u32, rtsp_types::Response<Bytes>), Error> {
+        req: &mut OwnedMessage,
+    ) -> Result<(RtspMessageContext, u32, msg::Response, Bytes), Error> {
         loop {
             let cseq = self.fill_req(options, requested_auth, req)?;
-            self.inner
-                .send(rtsp_types::Message::Request(req.clone()))
-                .await
-                .map_err(|e| wrap!(e))?;
-            let method: &str = req.method().into();
-            let (resp, msg_ctx) = loop {
+            self.inner.send(req.clone()).await.map_err(|e| wrap!(e))?;
+            let method: &str = req.method_str();
+            let (resp, resp_body, msg_ctx) = loop {
                 let msg = self.inner.next().await.unwrap_or_else(|| {
                     bail!(ErrorInt::RtspReadError {
                         conn_ctx: *self.inner.ctx(),
@@ -1256,41 +1218,44 @@ impl RtspConnection {
                 })?;
                 let msg_ctx = msg.ctx;
                 let description = match msg.msg {
-                    rtsp_types::Message::Response(r) => {
+                    msg::Message::Response(r) => {
                         if let Some(response_cseq) = parse::get_cseq(&r) {
                             if response_cseq == cseq {
-                                break (r, msg_ctx);
+                                break (r, msg.body, msg_ctx);
                             }
                             if matches!(mode, ResponseMode::Teardown) {
                                 debug!("ignoring unrelated response during TEARDOWN");
                                 continue;
                             }
-                            format!("{} response with CSeq {}", r.reason_phrase(), response_cseq)
+                            format!("{} response with CSeq {}", r.reason_phrase, response_cseq)
                         } else {
-                            format!("{} response with no/unparseable cseq", r.reason_phrase())
+                            format!("{} response with no/unparseable cseq", r.reason_phrase)
                         }
                     }
-                    rtsp_types::Message::Data(d) => {
+                    msg::Message::Data(d) => {
                         if matches!(mode, ResponseMode::Teardown) {
                             debug!("ignoring RTSP interleaved data during TEARDOWN");
                             continue;
                         } else if let (ResponseMode::Play, Some(m)) =
-                            (&mode, self.channels.lookup(d.channel_id()))
+                            (&mode, self.channels.lookup(d.channel_id))
                         {
                             debug!(
                                 "ignoring interleaved data message on {:?} channel {} while \
                                      waiting for response to {} CSeq {}",
-                                m.channel_type,
-                                d.channel_id(),
-                                method,
-                                cseq
+                                m.channel_type, d.channel_id, method, cseq
                             );
                             continue;
                         }
-                        self.handle_unassigned_data(msg_ctx, options, tool, d)?;
+                        self.handle_unassigned_data(
+                            msg_ctx,
+                            options,
+                            tool,
+                            d.channel_id,
+                            msg.body,
+                        )?;
                         continue;
                     }
-                    rtsp_types::Message::Request(r) => format!("{:?} request", r.method()),
+                    msg::Message::Request(r) => format!("{:?} request", r.method),
                 };
                 bail!(ErrorInt::RtspFramingError {
                     conn_ctx: *self.inner.ctx(),
@@ -1300,7 +1265,7 @@ impl RtspConnection {
                     ),
                 });
             };
-            if resp.status() == rtsp_types::StatusCode::Unauthorized {
+            if resp.status_code == StatusCode::UNAUTHORIZED {
                 if requested_auth.is_some() {
                     // TODO: the WWW-Authenticate might indicate a new domain or nonce.
                     // In that case, we should retry rather than returning error.
@@ -1309,17 +1274,17 @@ impl RtspConnection {
                         msg_ctx,
                         method: req.method().clone(),
                         cseq,
-                        status: resp.status(),
+                        status: resp.status_code,
                         description: "Received Unauthorized after trying digest auth".into(),
                     })
                 }
-                let www_authenticate = match resp.header(&rtsp_types::headers::WWW_AUTHENTICATE) {
+                let www_authenticate = match resp.headers.get("WWW-Authenticate") {
                     None => bail!(ErrorInt::RtspResponseError {
                         conn_ctx: *self.inner.ctx(),
                         msg_ctx,
                         method: req.method().clone(),
                         cseq,
-                        status: resp.status(),
+                        status: resp.status_code,
                         description: "Unauthorized without WWW-Authenticate header".into(),
                     }),
                     Some(h) => h,
@@ -1330,12 +1295,12 @@ impl RtspConnection {
                         msg_ctx,
                         method: req.method().clone(),
                         cseq,
-                        status: resp.status(),
+                        status: resp.status_code,
                         description: "Authentication requested and no credentials supplied"
                             .to_owned(),
                     })
                 }
-                let www_authenticate = www_authenticate.as_str();
+                let www_authenticate: &str = www_authenticate;
                 *requested_auth = match http_auth::PasswordClient::try_from(www_authenticate) {
                     Ok(c) => Some(c),
                     Err(e) => bail!(ErrorInt::RtspResponseError {
@@ -1343,22 +1308,22 @@ impl RtspConnection {
                         msg_ctx,
                         method: req.method().clone(),
                         cseq,
-                        status: resp.status(),
+                        status: resp.status_code,
                         description: format!("Can't understand WWW-Authenticate header: {e}"),
                     }),
                 };
                 continue;
-            } else if !resp.status().is_success() {
+            } else if !resp.status_code.is_success() {
                 bail!(ErrorInt::RtspResponseError {
                     conn_ctx: *self.inner.ctx(),
                     msg_ctx,
                     method: req.method().clone(),
                     cseq,
-                    status: resp.status(),
+                    status: resp.status_code,
                     description: "Unexpected RTSP response status".into(),
                 });
             }
-            return Ok((msg_ctx, cseq, resp));
+            return Ok((msg_ctx, cseq, resp, resp_body));
         }
     }
 
@@ -1368,7 +1333,8 @@ impl RtspConnection {
         msg_ctx: RtspMessageContext,
         options: &SessionOptions,
         tool: Option<&Tool>,
-        data: Data<Bytes>,
+        channel_id: u8,
+        data: Bytes,
     ) -> Result<(), Error> {
         let live555 = match options.unassigned_channel_data {
             UnassignedChannelDataPolicy::Auto
@@ -1385,32 +1351,30 @@ impl RtspConnection {
                          This is the first such message. Following messages will be logged \
                          at trace priority only.\n\n\
                          conn: {}\nmsg: {}\ndata: {:#?}",
-                        data.channel_id(),
+                        channel_id,
                         self.inner.ctx(),
                         &msg_ctx,
-                        crate::hex::LimitedHex::new(data.as_slice(), 128),
+                        crate::hex::LimitedHex::new(&data, 128),
                     );
                     self.seen_unassigned = true;
                 } else {
                     log::trace!(
                         "Ignoring data on unassigned RTSP interleaved data channel {}.\n\n\
                          conn: {}\nmsg: {}\ndata: {:#?}",
-                        data.channel_id(),
+                        channel_id,
                         self.inner.ctx(),
                         &msg_ctx,
-                        crate::hex::LimitedHex::new(data.as_slice(), 128),
+                        crate::hex::LimitedHex::new(&data, 128),
                     );
                 }
                 return Ok(());
             }
         };
 
-        let channel_id = data.channel_id();
         if live555 {
             note_stale_live555_data(tool, options, self.inner.ctx(), channel_id, &msg_ctx);
         }
 
-        let data = data.into_body();
         bail!(ErrorInt::RtspUnassignedChannelError {
             conn_ctx: *self.inner.ctx(),
             msg_ctx,
@@ -1424,7 +1388,7 @@ impl RtspConnection {
         &mut self,
         options: &SessionOptions,
         requested_auth: &mut Option<http_auth::PasswordClient>,
-        req: &mut rtsp_types::Request<Bytes>,
+        req: &mut OwnedMessage,
     ) -> Result<u32, Error> {
         let cseq = self.next_cseq;
         self.next_cseq += 1;
@@ -1437,21 +1401,32 @@ impl RtspConnection {
                 .respond(&http_auth::PasswordParams {
                     username: &creds.username,
                     password: &creds.password,
-                    uri: req.request_uri().map(|u| u.as_str()).unwrap_or("*"),
-                    method: req.method().into(),
+                    uri: req.request_uri_str(),
+                    method: req.method_str(),
                     body: Some(&[]),
                 })
                 .map_err(|e| wrap!(ErrorInt::Internal(e.into())))?;
-            req.insert_header(rtsp_types::headers::AUTHORIZATION, authorization);
+            let headers = req.headers_mut();
+            headers.insert(
+                msg::HeaderName::AUTHORIZATION,
+                msg::HeaderValue::try_from(authorization).unwrap(),
+            );
         }
-        req.insert_header(rtsp_types::headers::CSEQ, cseq.to_string());
+        let headers = req.headers_mut();
+        headers.insert(
+            msg::HeaderName::CSEQ,
+            msg::HeaderValue::try_from(cseq.to_string()).unwrap(),
+        );
 
         let user_agent = if let Some(ref u) = options.user_agent {
             u
         } else {
             DEFAULT_USER_AGENT
         };
-        req.insert_header(rtsp_types::headers::USER_AGENT, user_agent.to_string());
+        headers.insert(
+            msg::HeaderName::USER_AGENT,
+            msg::HeaderValue::try_from(user_agent.to_string()).unwrap(),
+        );
 
         Ok(cseq)
     }
@@ -1492,12 +1467,20 @@ impl Session<Described> {
         options: SessionOptions,
         url: Url,
     ) -> Result<Self, Error> {
-        let mut req = rtsp_types::Request::builder(Method::Describe, rtsp_types::Version::V1_0)
-            .header(rtsp_types::headers::ACCEPT, "application/sdp")
-            .request_uri(url.clone())
-            .build(Bytes::new());
+        let mut req = OwnedMessage::Request {
+            head: msg::Request {
+                method: msg::Method::DESCRIBE,
+                request_uri: Some(url.clone()),
+                headers: [(
+                    msg::HeaderName::ACCEPT,
+                    msg::HeaderValue::try_from("application/sdp").unwrap(),
+                )]
+                .into(),
+            },
+            body: Bytes::new(),
+        };
         let mut requested_auth = None;
-        let (msg_ctx, cseq, response) = conn
+        let (msg_ctx, cseq, response, resp_body) = conn
             .send(
                 ResponseMode::Normal,
                 &options,
@@ -1506,18 +1489,19 @@ impl Session<Described> {
                 &mut req,
             )
             .await?;
-        let presentation = parse::parse_describe(url, &response).map_err(|description| {
-            wrap!(ErrorInt::RtspResponseError {
-                conn_ctx: *conn.inner.ctx(),
-                msg_ctx,
-                method: rtsp_types::Method::Describe,
-                cseq,
-                status: response.status(),
-                description,
-            })
-        })?;
-        let describe_status = response.status();
-        let sdp = response.into_body();
+        let presentation =
+            parse::parse_describe(url, &response, &resp_body).map_err(|description| {
+                wrap!(ErrorInt::RtspResponseError {
+                    conn_ctx: *conn.inner.ctx(),
+                    msg_ctx,
+                    method: msg::Method::DESCRIBE,
+                    cseq,
+                    status: response.status_code,
+                    description,
+                })
+            })?;
+        let describe_status = response.status_code;
+        let sdp = resp_body;
         Ok(Session(
             Box::pin(SessionInner {
                 conn: Some(conn),
@@ -1570,8 +1554,7 @@ impl Session<Described> {
             .as_ref()
             .unwrap_or(&inner.presentation.control)
             .clone();
-        let mut req =
-            rtsp_types::Request::builder(Method::Setup, rtsp_types::Version::V1_0).request_uri(url);
+        let mut headers = msg::Headers::default();
         let udp = match options.transport {
             Transport::Tcp(_) => {
                 let proposed_channel_id = conn.channels.next_unassigned().ok_or_else(|| {
@@ -1579,13 +1562,14 @@ impl Session<Described> {
                         "no unassigned channels".into()
                     ))
                 })?;
-                req = req.header(
-                    rtsp_types::headers::TRANSPORT,
-                    format!(
+                headers.insert(
+                    msg::HeaderName::TRANSPORT,
+                    msg::HeaderValue::try_from(format!(
                         "RTP/AVP/TCP;unicast;interleaved={}-{}",
                         proposed_channel_id,
                         proposed_channel_id + 1
-                    ),
+                    ))
+                    .unwrap(),
                 );
                 *inner.flags |= SessionFlag::TcpStreams as u8;
                 None
@@ -1596,13 +1580,14 @@ impl Session<Described> {
                 let local_ip = conn.inner.ctx().local_addr.ip();
                 let pair = crate::tokio::UdpPair::for_ip(local_ip)
                     .map_err(|e| wrap!(ErrorInt::Internal(e.into())))?;
-                req = req.header(
-                    rtsp_types::headers::TRANSPORT,
-                    format!(
+                headers.insert(
+                    msg::HeaderName::TRANSPORT,
+                    msg::HeaderValue::try_from(format!(
                         "RTP/AVP/UDP;unicast;client_port={}-{}",
                         pair.rtp_port,
                         pair.rtp_port + 1,
-                    ),
+                    ))
+                    .unwrap(),
                 );
                 *inner.flags |= SessionFlag::UdpStreams as u8;
                 Some((
@@ -1620,25 +1605,36 @@ impl Session<Described> {
             }
         };
         if let &mut Some(ref s) = inner.session {
-            req = req.header(rtsp_types::headers::SESSION, s.id.to_string());
+            headers.insert(
+                msg::HeaderName::SESSION,
+                msg::HeaderValue::try_from(s.id.to_string()).unwrap(),
+            );
         }
-        let (msg_ctx, cseq, response) = conn
+        let mut req = OwnedMessage::Request {
+            head: msg::Request {
+                method: msg::Method::SETUP,
+                request_uri: Some(url),
+                headers,
+            },
+            body: Bytes::new(),
+        };
+        let (msg_ctx, cseq, response, _resp_body) = conn
             .send(
                 ResponseMode::Normal,
                 inner.options,
                 inner.presentation.tool.as_ref(),
                 inner.requested_auth,
-                &mut req.build(Bytes::new()),
+                &mut req,
             )
             .await?;
         debug!("SETUP response: {:#?}", &response);
         let conn_ctx = conn.inner.ctx();
-        let status = response.status();
+        let status = response.status_code;
         let response = parse::parse_setup(&response).map_err(|description| {
             wrap!(ErrorInt::RtspResponseError {
                 conn_ctx: *conn_ctx,
                 msg_ctx,
-                method: rtsp_types::Method::Setup,
+                method: msg::Method::SETUP,
                 cseq,
                 status,
                 description,
@@ -1652,7 +1648,7 @@ impl Session<Described> {
                         bail!(ErrorInt::RtspResponseError {
                             conn_ctx: *conn.inner.ctx(),
                             msg_ctx,
-                            method: rtsp_types::Method::Setup,
+                            method: msg::Method::SETUP,
                             cseq,
                             status,
                             description: format!(
@@ -1681,7 +1677,7 @@ impl Session<Described> {
                     None => bail!(ErrorInt::RtspResponseError {
                         conn_ctx: *conn.inner.ctx(),
                         msg_ctx,
-                        method: rtsp_types::Method::Setup,
+                        method: msg::Method::SETUP,
                         cseq,
                         status,
                         description: "Transport header is missing interleaved parameter".to_owned(),
@@ -1693,7 +1689,7 @@ impl Session<Described> {
                         wrap!(ErrorInt::RtspResponseError {
                             conn_ctx: *conn_ctx,
                             msg_ctx,
-                            method: rtsp_types::Method::Setup,
+                            method: msg::Method::SETUP,
                             cseq,
                             status,
                             description,
@@ -1719,7 +1715,7 @@ impl Session<Described> {
                     wrap!(ErrorInt::RtspResponseError {
                         conn_ctx: *conn_ctx,
                         msg_ctx,
-                        method: rtsp_types::Method::Setup,
+                        method: msg::Method::SETUP,
                         cseq,
                         status,
                         description: "Transport header is missing server_port parameter".to_owned(),
@@ -1744,6 +1740,11 @@ impl Session<Described> {
                 udp_sockets = Some(sockets);
             }
         };
+        if let Some(format) = options.frame_format
+            && let Ok(d) = &mut stream.depacketizer
+        {
+            d.set_frame_format(format);
+        }
         stream.state = StreamState::Init(StreamStateInit {
             ssrc: response.ssrc,
             initial_seq: None,
@@ -1783,26 +1784,39 @@ impl Session<Described> {
 
         trace!("PLAY with channel mappings: {:#?}", &conn.channels);
         *inner.flags |= SessionFlag::MaybePlaying as u8;
-        let (msg_ctx, cseq, response) = conn
+        let (msg_ctx, cseq, response, _resp_body) = conn
             .send(
                 ResponseMode::Play,
                 inner.options,
                 inner.presentation.tool.as_ref(),
                 inner.requested_auth,
-                &mut rtsp_types::Request::builder(Method::Play, rtsp_types::Version::V1_0)
-                    .request_uri(inner.presentation.control.clone())
-                    .header(rtsp_types::headers::SESSION, &*session.id)
-                    .header(rtsp_types::headers::RANGE, "npt=0.000-".to_owned())
-                    .build(Bytes::new()),
+                &mut OwnedMessage::Request {
+                    head: msg::Request {
+                        method: msg::Method::PLAY,
+                        request_uri: Some(inner.presentation.control.clone()),
+                        headers: [
+                            (
+                                msg::HeaderName::SESSION,
+                                msg::HeaderValue::try_from(&*session.id).unwrap(),
+                            ),
+                            (
+                                msg::HeaderName::RANGE,
+                                msg::HeaderValue::try_from("npt=0.000-").unwrap(),
+                            ),
+                        ]
+                        .into(),
+                    },
+                    body: Bytes::new(),
+                },
             )
             .await?;
         parse::parse_play(&response, inner.presentation).map_err(|description| {
             wrap!(ErrorInt::RtspResponseError {
                 conn_ctx: *conn.inner.ctx(),
                 msg_ctx,
-                method: rtsp_types::Method::Play,
+                method: msg::Method::PLAY,
                 cseq,
-                status: response.status(),
+                status: response.status_code,
                 description,
             })
         })?;
@@ -1832,7 +1846,6 @@ impl Session<Described> {
                     ssrc,
                     ctx,
                     udp_sockets,
-                    ..
                 }) => {
                     let initial_rtptime = match policy.initial_timestamp {
                         InitialTimestampPolicy::Require | InitialTimestampPolicy::Default
@@ -1842,9 +1855,9 @@ impl Session<Described> {
                                 bail!(ErrorInt::RtspResponseError {
                                     conn_ctx: *conn.inner.ctx(),
                                     msg_ctx,
-                                    method: rtsp_types::Method::Play,
+                                    method: msg::Method::PLAY,
                                     cseq,
-                                    status: response.status(),
+                                    status: response.status_code,
                                     description: format!(
                                         "Expected rtptime on PLAY with mode {:?}, missing on \
                                              stream {} ({:?}). Consider setting initial timestamp \
@@ -1897,9 +1910,9 @@ impl Session<Described> {
                             wrap!(ErrorInt::RtspResponseError {
                                 conn_ctx: *conn_ctx,
                                 msg_ctx,
-                                method: rtsp_types::Method::Play,
+                                method: msg::Method::PLAY,
                                 cseq,
-                                status: response.status(),
+                                status: response.status_code,
                                 description,
                             })
                         })?,
@@ -2077,7 +2090,7 @@ impl Session<Playing> {
                 bail!(ErrorInt::RtspResponseError {
                     conn_ctx: *conn.inner.ctx(),
                     msg_ctx: *inner.describe_ctx,
-                    method: rtsp_types::Method::Describe,
+                    method: msg::Method::DESCRIBE,
                     cseq: *inner.describe_cseq,
                     status: *inner.describe_status,
                     description: description.clone(),
@@ -2160,14 +2173,22 @@ impl Session<Playing> {
         } else {
             KeepaliveMethod::Options
         };
-        let mut req = rtsp_types::Request::builder(method.into(), rtsp_types::Version::V1_0)
-            .request_uri(inner.presentation.base_url.clone())
-            .header(rtsp_types::headers::SESSION, session.id.to_string())
-            .build(Bytes::new());
+        let mut req = OwnedMessage::Request {
+            head: msg::Request {
+                method: method.into(),
+                request_uri: Some(inner.presentation.base_url.clone()),
+                headers: [(
+                    msg::HeaderName::SESSION,
+                    msg::HeaderValue::try_from(session.id.to_string()).unwrap(),
+                )]
+                .into(),
+            },
+            body: Bytes::new(),
+        };
         let cseq = conn.fill_req(inner.options, inner.requested_auth, &mut req)?;
         trace!("sending {:?} keepalive", method);
         conn.inner
-            .start_send_unpin(rtsp_types::Message::Request(req))
+            .start_send_unpin(req)
             .expect("encoding is infallible");
         *inner.keepalive_state = match conn.inner.poll_flush_unpin(cx) {
             Poll::Ready(Ok(())) => KeepaliveState::Waiting { cseq, method },
@@ -2187,7 +2208,7 @@ impl Session<Playing> {
     fn handle_response(
         mut self: Pin<&mut Self>,
         msg_ctx: &crate::RtspMessageContext,
-        response: rtsp_types::Response<Bytes>,
+        response: msg::Response,
     ) -> Result<(), Error> {
         let inner = self.0.as_mut().project();
         match inner.keepalive_state {
@@ -2198,10 +2219,10 @@ impl Session<Playing> {
                 // log it, to help debugging if on failure the server doesn't extend the
                 // timeout or gets angry and closes the connection. (rtsp-simple-server
                 // does the latter as of 2022-08-07, though I'm told this will be fixed.)
-                if !response.status().is_success() {
-                    warn!("keepalive failed with {:?}", response.status());
+                if !response.status_code.is_success() {
+                    warn!("keepalive failed with {:?}", response.status_code);
                 } else {
-                    trace!("keepalive succeeded with {:?}", response.status());
+                    trace!("keepalive succeeded with {:?}", response.status_code);
                     if matches!(method, KeepaliveMethod::Options) {
                         match parse::parse_options(&response) {
                             Ok(r) => {
@@ -2240,14 +2261,14 @@ impl Session<Playing> {
     fn handle_data(
         mut self: Pin<&mut Self>,
         msg_ctx: &RtspMessageContext,
-        data: rtsp_types::Data<Bytes>,
+        channel_id: u8,
+        body: Bytes,
     ) -> Result<Option<PacketItem>, Error> {
         let inner = self.0.as_mut().project();
         let conn = inner
             .conn
             .as_mut()
             .ok_or_else(|| wrap!(ErrorInt::FailedPrecondition("no connection".into())))?;
-        let channel_id = data.channel_id();
         let pkt_ctx = crate::PacketContext(crate::PacketContextInner::Tcp { msg_ctx: *msg_ctx });
         let m = match conn.channels.lookup(channel_id) {
             Some(m) => m,
@@ -2256,7 +2277,8 @@ impl Session<Playing> {
                     *msg_ctx,
                     inner.options,
                     inner.presentation.tool.as_ref(),
-                    data,
+                    channel_id,
+                    body,
                 )?;
                 return Ok(None);
             }
@@ -2283,7 +2305,7 @@ impl Session<Playing> {
                 &pkt_ctx,
                 timeline,
                 m.stream_i,
-                data.into_body(),
+                body,
             )?),
             ChannelType::Rtcp => {
                 match rtp_handler.rtcp(
@@ -2294,7 +2316,7 @@ impl Session<Playing> {
                     &pkt_ctx,
                     timeline,
                     m.stream_i,
-                    data.into_body(),
+                    body,
                 ) {
                     Ok(p) => Ok(p),
                     Err(description) => Err(wrap!(ErrorInt::PacketError {
@@ -2342,11 +2364,13 @@ impl Session<Playing> {
 
         // Prioritize RTCP over RTP within a stream.
         while let Poll::Ready(r) = udp_sockets.rtcp.poll_recv(cx, buf) {
-            let when = crate::WallTime::now();
+            let when = Instant::now();
+            let when_wall = crate::WallTime::now();
             match r {
                 Ok(()) => {
                     let pkt_ctx = crate::PacketContext(crate::PacketContextInner::Udp {
-                        received_wall: when,
+                        received: when,
+                        received_wall: when_wall,
                     });
                     let msg = Bytes::copy_from_slice(buf.filled());
                     match rtp_handler.rtcp(
@@ -2383,19 +2407,21 @@ impl Session<Playing> {
                     return Poll::Ready(Some(Err(wrap!(ErrorInt::UdpRecvError {
                         conn_ctx: *conn_ctx,
                         stream_ctx: stream_ctx.to_owned(),
-                        when,
+                        when: when_wall,
                         source,
                     }))));
                 }
             }
         }
         while let Poll::Ready(r) = udp_sockets.rtp.poll_recv(cx, buf) {
-            let when = crate::WallTime::now();
+            let when = Instant::now();
+            let when_wall = crate::WallTime::now();
             match r {
                 Ok(()) => {
                     let msg = Bytes::copy_from_slice(buf.filled());
                     let pkt_ctx = crate::PacketContext(crate::PacketContextInner::Udp {
-                        received_wall: when,
+                        received: when,
+                        received_wall: when_wall,
                     });
                     match rtp_handler.rtp(
                         inner.options,
@@ -2420,7 +2446,7 @@ impl Session<Playing> {
                     return Poll::Ready(Some(Err(wrap!(ErrorInt::UdpRecvError {
                         conn_ctx: *conn_ctx,
                         stream_ctx: stream_ctx.to_owned(),
-                        when,
+                        when: when_wall,
                         source,
                     }))));
                 }
@@ -2548,20 +2574,20 @@ impl futures::Stream for Session<Playing> {
             // probably drop us.
             match Pin::new(&mut self.0.conn.as_mut().unwrap().inner).poll_next(cx) {
                 Poll::Ready(Some(Ok(msg))) => match msg.msg {
-                    rtsp_types::Message::Data(data) => {
-                        match self.as_mut().handle_data(&msg.ctx, data) {
+                    msg::Message::Data(d) => {
+                        match self.as_mut().handle_data(&msg.ctx, d.channel_id, msg.body) {
                             Err(e) => return Poll::Ready(Some(Err(e))),
                             Ok(Some(pkt)) => return Poll::Ready(Some(Ok(pkt))),
                             Ok(None) => continue,
                         };
                     }
-                    rtsp_types::Message::Response(response) => {
+                    msg::Message::Response(response) => {
                         if let Err(e) = self.as_mut().handle_response(&msg.ctx, response) {
                             return Poll::Ready(Some(Err(e)));
                         }
                         continue;
                     }
-                    rtsp_types::Message::Request(request) => {
+                    msg::Message::Request(request) => {
                         warn!(
                             "Received RTSP request in Playing state. Responding unimplemented.\n{:#?}",
                             request
@@ -2758,20 +2784,26 @@ mod tests {
     /// Receives a request and sends a response, filling in the matching `CSeq`.
     async fn req_response(
         server: &mut crate::tokio::Connection,
-        expected_method: rtsp_types::Method,
-        mut response: rtsp_types::Response<Bytes>,
+        expected_method: msg::Method,
+        (mut response, resp_body): (msg::Response, Bytes),
     ) {
         let msg = server.next().await.unwrap().unwrap();
         let cseq = match msg.msg {
-            rtsp_types::Message::Request(ref r) => {
-                assert_eq!(r.method(), expected_method);
-                r.header(&rtsp_types::headers::CSEQ).unwrap()
+            msg::Message::Request(ref r) => {
+                assert_eq!(r.method, expected_method);
+                r.headers.get("CSeq").unwrap().to_string()
             }
             _ => panic!(),
         };
-        response.insert_header(rtsp_types::headers::CSEQ, cseq.as_str());
+        response.headers.insert(
+            msg::HeaderName::CSEQ,
+            msg::HeaderValue::try_from(cseq).unwrap(),
+        );
         server
-            .send(rtsp_types::Message::Response(response))
+            .send(OwnedMessage::Response {
+                head: response,
+                body: resp_body,
+            })
             .await
             .unwrap();
     }
@@ -2795,7 +2827,7 @@ mod tests {
             ),
             req_response(
                 &mut server,
-                rtsp_types::Method::Describe,
+                msg::Method::DESCRIBE,
                 response(include_bytes!("testdata/reolink_describe.txt"))
             ),
         );
@@ -2809,7 +2841,7 @@ mod tests {
             },
             req_response(
                 &mut server,
-                rtsp_types::Method::Setup,
+                msg::Method::SETUP,
                 response(include_bytes!("testdata/reolink_setup.txt"))
             ),
         );
@@ -2819,11 +2851,10 @@ mod tests {
             session.play(PlayOptions::default()),
             req_response(
                 &mut server,
-                rtsp_types::Method::Play,
+                msg::Method::PLAY,
                 response(include_bytes!("testdata/reolink_play.txt"))
             ),
         );
-        let drop_time;
         {
             let session = session.unwrap();
             tokio::pin!(session);
@@ -2848,49 +2879,47 @@ mod tests {
                 async {
                     let bad_pkt = b"data on unassigned channel";
                     server
-                        .send(rtsp_types::Message::Data(rtsp_types::Data::new(
-                            2,
-                            Bytes::from_static(bad_pkt),
-                        )))
+                        .send(OwnedMessage::Data {
+                            channel_id: 2,
+                            body: Bytes::from_static(bad_pkt),
+                        })
                         .await
                         .unwrap();
                     let good_pkt = b"\x80\x60\x41\xd4\x00\x00\x00\x00\xdc\xc4\xa0\xd8hello world";
                     server
-                        .send(rtsp_types::Message::Data(rtsp_types::Data::new(
-                            0,
-                            Bytes::from_static(good_pkt),
-                        )))
+                        .send(OwnedMessage::Data {
+                            channel_id: 0,
+                            body: Bytes::from_static(good_pkt),
+                        })
                         .await
                         .unwrap();
                 },
             );
-
-            drop_time = tokio::time::Instant::now();
         };
 
         // Drop (initiated by exiting the scope above).
         // This server advertises an ancient version of live555, so Retina
         // sends a TEARDOWN even with TCP.
+
         let stale_sessions = group.stale_sessions();
         assert_eq!(stale_sessions.num_sessions, 1);
+
+        // Resume real time for the TEARDOWN exchange. With paused time,
+        // the runtime may auto-advance through the teardown's I/O timeout
+        // before the I/O exchange with the mock server completes, because
+        // the auto-advance's non-blocking I/O poll can race with kernel
+        // TCP event delivery on localhost.
+        tokio::time::resume();
         tokio::join!(
             group.await_stale_sessions(&stale_sessions),
             req_response(
                 &mut server,
-                rtsp_types::Method::Teardown,
+                msg::Method::TEARDOWN,
                 response(include_bytes!("testdata/reolink_teardown.txt"))
             ),
         );
+        tokio::time::pause();
         assert_eq!(group.stale_sessions().num_sessions, 0);
-
-        // XXX: tokio will "auto-advance" paused time when timers are polled,
-        // including background_teardown's timer_at, so elapsed > 0.
-        // <https://github.com/tokio-rs/tokio/issues/4522>
-        let elapsed = tokio::time::Instant::now() - drop_time;
-        assert!(
-            elapsed < std::time::Duration::from_secs(60),
-            "elapsed={elapsed:?}"
-        );
     }
 
     /// As above, but TEARDOWN fails until session expiration.
@@ -2910,7 +2939,7 @@ mod tests {
             ),
             req_response(
                 &mut server,
-                rtsp_types::Method::Describe,
+                msg::Method::DESCRIBE,
                 response(include_bytes!("testdata/reolink_describe.txt"))
             ),
         );
@@ -2924,7 +2953,7 @@ mod tests {
             },
             req_response(
                 &mut server,
-                rtsp_types::Method::Setup,
+                msg::Method::SETUP,
                 response(include_bytes!("testdata/reolink_setup.txt"))
             ),
         );
@@ -2934,7 +2963,7 @@ mod tests {
             session.play(PlayOptions::default()),
             req_response(
                 &mut server,
-                rtsp_types::Method::Play,
+                msg::Method::PLAY,
                 response(include_bytes!("testdata/reolink_play.txt"))
             ),
         );
@@ -2958,10 +2987,10 @@ mod tests {
                 async {
                     let pkt = b"\x80\x60\x41\xd4\x00\x00\x00\x00\xdc\xc4\xa0\xd8hello world";
                     server
-                        .send(rtsp_types::Message::Data(rtsp_types::Data::new(
-                            0,
-                            Bytes::from_static(pkt),
-                        )))
+                        .send(OwnedMessage::Data {
+                            channel_id: 0,
+                            body: Bytes::from_static(pkt),
+                        })
                         .await
                         .unwrap();
                 },
@@ -2999,10 +3028,10 @@ mod tests {
         let (conn, mut server) = connect_to_mock().await;
         let url = Url::parse("rtsp://192.168.5.206:554/h264Preview_01_main").unwrap();
         let group = Arc::new(SessionGroup::default());
-        let bogus_rtp = rtsp_types::Message::Data(rtsp_types::Data::new(
-            0,                                // RTP channel
-            Bytes::from_static(b"bogus pkt"), // the real packet parses but this is fine.
-        ));
+        let bogus_rtp = OwnedMessage::Data {
+            channel_id: 0,
+            body: Bytes::from_static(b"bogus pkt"),
+        };
 
         let start = tokio::time::Instant::now();
 
@@ -3043,14 +3072,14 @@ mod tests {
         init_logging();
         let (conn, mut server) = connect_to_mock().await;
         let url = Url::parse("rtsp://192.168.5.206:554/h264Preview_01_main").unwrap();
-        let bogus_rtp = rtsp_types::Message::Data(rtsp_types::Data::new(
-            0,                                // RTP channel
-            Bytes::from_static(b"bogus pkt"), // the real packet parses but this is fine.
-        ));
-        let bogus_rtcp = rtsp_types::Message::Data(rtsp_types::Data::new(
-            1,                                // RTCP channel
-            Bytes::from_static(b"bogus pkt"), // the real packet parses but this is fine.
-        ));
+        let bogus_rtp = OwnedMessage::Data {
+            channel_id: 0,
+            body: Bytes::from_static(b"bogus pkt"),
+        };
+        let bogus_rtcp = OwnedMessage::Data {
+            channel_id: 1,
+            body: Bytes::from_static(b"bogus pkt"),
+        };
 
         // DESCRIBE.
         let (session, _) = tokio::join!(
@@ -3058,7 +3087,7 @@ mod tests {
             async {
                 req_response(
                     &mut server,
-                    rtsp_types::Method::Describe,
+                    msg::Method::DESCRIBE,
                     response(include_bytes!("testdata/reolink_describe.txt")),
                 )
                 .await;
@@ -3074,7 +3103,7 @@ mod tests {
             },
             req_response(
                 &mut server,
-                rtsp_types::Method::Setup,
+                msg::Method::SETUP,
                 response(include_bytes!("testdata/reolink_setup.txt"))
             ),
         );
@@ -3085,7 +3114,7 @@ mod tests {
             server.send(bogus_rtcp).await.unwrap();
             req_response(
                 &mut server,
-                rtsp_types::Method::Play,
+                msg::Method::PLAY,
                 response(include_bytes!("testdata/reolink_play.txt")),
             )
             .await
@@ -3120,7 +3149,7 @@ mod tests {
             ),
             req_response(
                 &mut server,
-                rtsp_types::Method::Describe,
+                msg::Method::DESCRIBE,
                 response(include_bytes!("testdata/h264dvr_describe.txt"))
             ),
         );
@@ -3141,7 +3170,7 @@ mod tests {
             },
             req_response(
                 &mut server,
-                rtsp_types::Method::Setup,
+                msg::Method::SETUP,
                 response(include_bytes!("testdata/h264dvr_setup_video.txt"))
             ),
         );
@@ -3164,7 +3193,7 @@ mod tests {
             },
             req_response(
                 &mut server,
-                rtsp_types::Method::Setup,
+                msg::Method::SETUP,
                 response(include_bytes!("testdata/h264dvr_setup_audio.txt"))
             ),
         );

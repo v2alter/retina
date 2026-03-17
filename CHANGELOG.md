@@ -1,5 +1,18 @@
-## unreleased
+## `v0.4.19` (2026-03-13)
 
+*   support cameras which improperly set the RTP "MARK" bit on SEI data,
+    including the [LV-IP22IR40DVBL](https://skyboo.net/2017/07/how-to-hack-my-own-ip-camera/) sold by Ivel.
+    See [moonfire-nvr#352](https://github.com/scottlamb/moonfire-nvr/issues/352).
+
+## `v0.4.18` (2026-03-10)
+
+*   `retina::codec::FrameFormat`: support Annex B encoding
+    ([#44](https://github.com/scottlamb/retina/issues/44)), ADTS encoding,
+    and parameter set insertion control. This makes it easier to feed
+    frames directly to a decoder or muxer without munging them. It also
+    makes Retina's behavior more camera-agnostic: previously it would include
+    inline parameters or not based on what the camera choose; now it's
+    configurable via `frame_format`.
 *   use the `RUST_LOG` environment variable to control logging in the examples
     and tests. (Formerly it used `MOONFIRE_LOG`, but Retina is not part of
     Moonfire, and `RUST_LOG` is standard.) Document in `README.md`.
@@ -10,6 +23,13 @@
     [#80](https://github.com/scottlamb/retina/issues/80).
 *   add a new `webcodecs` example that decodes video frames using WebCodecs API.
     This is the absolute lowest-latency way to watch RTSP streams from a browser!
+*   expose receive timestamps (both wall clock and monotonic/instant) in packet
+    contexts.
+*   expose coded as well as display pixel dimensions in `VideoParameters` to ease
+    construction of a WebCodecs `VideoDecoderConfiguration`.
+*   expose number of audio channels in `AudioParameters` to ease construction of
+    a WebCodecs `AudioDecoderConfig`.
+*   allow producing `VideoParameters` from H.264 SPS and PPS NALs.
 
 ## `v0.4.17` (2026-02-17)
 

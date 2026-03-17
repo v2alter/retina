@@ -1,4 +1,4 @@
-// Copyright (C) 2021 Scott Lamb <slamb@slamb.org>
+// Copyright (C) The Retina Authors
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
 //! Tests client performance against a mock server.
@@ -106,7 +106,13 @@ async fn read_to_eof(addr: SocketAddr) {
         retina::client::Session::describe(url, retina::client::SessionOptions::default())
             .await
             .unwrap();
-    session.setup(0, SetupOptions::default()).await.unwrap();
+    session
+        .setup(
+            0,
+            SetupOptions::default().frame_format(retina::codec::FrameFormat::MP4),
+        )
+        .await
+        .unwrap();
     let session = session
         .play(PlayOptions::default())
         .await

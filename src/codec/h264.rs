@@ -1,4 +1,4 @@
-// Copyright (C) 2021 Scott Lamb <slamb@slamb.org>
+// Copyright (C) The Retina Authors
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
 //! [H.264](https://www.itu.int/rec/T-REC-H.264-201906-I/en)-encoded video,
@@ -9,18 +9,43 @@ use std::{collections::VecDeque, convert::TryFrom};
 
 use base64::Engine as _;
 use bytes::{Buf, BufMut, Bytes, BytesMut};
+use h264_reader::nal::sps::{SeqParameterSet, SpsError};
 use h264_reader::nal::{NalHeader, UnitType};
 use log::{debug, log_enabled, trace};
 
 use crate::Error;
-use crate::codec::DepacketizeError;
+use crate::codec::{AllPixelDimensions, DepacketizeError};
 use crate::{
     Timestamp,
     codec::h26x::TolerantBitReader,
     rtp::{ReceivedPacket, ReceivedPacketBuilder},
 };
 
-use super::{CodecItem, VideoFrame};
+use super::{CodecItem, VideoFrame, VideoParameters};
+
+/// Produce [`VideoParameters`] from SPS and PPS NAL units.
+///
+/// It's sometimes useful to "fix" a server's parameters, e.g.:
+///
+/// * adding missing pixel aspect ratio information to the SPS VUI so that
+///   anamorphic video is displayed at the correct aspect ratio.
+/// * adding missing bitstream restrictions such as `num_reorder_frames = 0`
+///   that significantly reduce decode latency.
+/// * removing garbage after the RBSP trailing bits.
+///
+/// Retina currently does not support directly making these changes itself, but
+/// callers can use e.g. [`h264_reader`](https://crates.io/crates/h264_reader)
+/// to rewrite the SPS, then use Retina's logic to repackage the parameters into
+/// a [`VideoParameters`].
+pub fn parameters_from_sps_and_pps(
+    sps_nal: &[u8],
+    pps_nal: &[u8],
+    framing: super::h26x::Framing,
+) -> Result<VideoParameters, Error> {
+    InternalParameters::parse_sps_and_pps(sps_nal, pps_nal, true, framing)
+        .map(|int| int.generic_parameters)
+        .map_err(|s| wrap!(crate::error::ErrorInt::InvalidArgument(s)))
+}
 
 /// A [super::Depacketizer] implementation which finds access unit boundaries
 /// and produces unfragmented NAL units as specified in [RFC
@@ -80,6 +105,9 @@ pub(crate) struct Depacketizer {
     /// True if we've seen a FU-A sequence where the NAL headers differ between
     /// fragments.
     seen_inconsistent_fu_a_nal_hdr: bool,
+
+    /// Output format controlling NAL framing and parameter set insertion.
+    frame_format: super::FrameFormat,
 }
 
 #[derive(Debug)]
@@ -229,7 +257,31 @@ impl Depacketizer {
             nals: Vec::new(),
             parameters,
             seen_inconsistent_fu_a_nal_hdr: false,
+            frame_format: Default::default(),
         })
+    }
+
+    /// Sets the frame format for output assembly.
+    ///
+    /// If existing parameters were parsed with a different framing, they are
+    /// re-parsed to produce the correct `extra_data` format.
+    pub(super) fn set_frame_format(&mut self, format: super::FrameFormat) {
+        self.frame_format = format;
+
+        // Re-parse existing parameters so extra_data matches the new framing.
+        if let Some(ref ip) = self.parameters {
+            // Re-parse is infallible here—these params were already successfully
+            // parsed once—so unwrap via expect.
+            self.parameters = Some(
+                InternalParameters::parse_sps_and_pps(
+                    &ip.sps_nal,
+                    &ip.pps_nal,
+                    ip.seen_extra_trailing_data,
+                    format.h26x_framing,
+                )
+                .expect("re-parse of previously valid SPS/PPS should not fail"),
+            );
+        }
     }
 
     pub(super) fn check_invariants(&self) {
@@ -665,6 +717,8 @@ impl Depacketizer {
     }
 
     fn finalize_access_unit(&mut self, au: AccessUnit, reason: &str) -> Result<VideoFrame, String> {
+        use super::{ParameterSetInsertion, h26x::Framing};
+
         let mut piece_idx = 0;
         let mut retained_len = 0usize;
         let mut is_random_access_point = true;
@@ -708,30 +762,19 @@ impl Depacketizer {
             if nal.hdr.nal_ref_idc() != 0 {
                 is_disposable = false;
             }
-            // TODO: support optionally filtering non-VUI NALs.
-            retained_len += 4usize + crate::to_usize(nal.len);
-            piece_idx = next_piece_idx;
-        }
-        let mut data = Vec::with_capacity(retained_len);
-        piece_idx = 0;
-        for nal in &self.nals {
-            let next_piece_idx = crate::to_usize(nal.next_piece_idx);
-            let nal_pieces = &self.pieces[piece_idx..next_piece_idx];
-            data.extend_from_slice(&nal.len.to_be_bytes()[..]);
-            data.push(nal.hdr.into());
-            let mut actual_len = 1;
-            for piece in nal_pieces {
-                debug_assert!(!piece.is_empty());
-                data.extend_from_slice(&piece[..]);
-                actual_len += piece.len();
+            // Always strip inline parameter sets; they're handled via
+            // ParameterSetInsertion and the canonical copy in self.parameters.
+            if !matches!(
+                nal.hdr.nal_unit_type(),
+                UnitType::SeqParameterSet | UnitType::PicParameterSet
+            ) {
+                retained_len += 4usize + crate::to_usize(nal.len);
             }
-            debug_assert_eq!(crate::to_usize(nal.len), actual_len);
             piece_idx = next_piece_idx;
         }
-        debug_assert_eq!(retained_len, data.len());
-        self.nals.clear();
-        self.pieces.clear();
 
+        // Update parameters before building the frame, so prepended params
+        // reflect the latest SPS/PPS.
         let has_new_parameters = match (
             new_sps.as_deref(),
             new_pps.as_deref(),
@@ -745,6 +788,7 @@ impl Depacketizer {
                     sps_nal,
                     pps_nal,
                     seen_extra_trailing_data,
+                    self.frame_format.h26x_framing,
                 )?);
                 true
             }
@@ -756,11 +800,68 @@ impl Depacketizer {
                     sps_nal,
                     pps_nal,
                     old_ip.seen_extra_trailing_data,
+                    self.frame_format.h26x_framing,
                 )?);
                 true
             }
             _ => false,
         };
+
+        // Determine whether to prepend parameter sets.
+        let prepend_params = is_random_access_point
+            && match self.frame_format.parameter_set_insertion {
+                ParameterSetInsertion::EachKeyFrame => true,
+                ParameterSetInsertion::OnChange => has_new_parameters,
+                ParameterSetInsertion::Never => false,
+            };
+        if prepend_params && let Some(ref p) = self.parameters {
+            // 4-byte prefix + SPS NAL + 4-byte prefix + PPS NAL
+            retained_len += 4 + p.sps_nal.len() + 4 + p.pps_nal.len();
+        }
+
+        let mut data = Vec::with_capacity(retained_len);
+
+        // Prepend parameter sets if requested.
+        if prepend_params && let Some(ref p) = self.parameters {
+            for param_nal in [&p.sps_nal, &p.pps_nal] {
+                let prefix = match self.frame_format.h26x_framing {
+                    Framing::FourByteLength => (param_nal.len() as u32).to_be_bytes(),
+                    Framing::AnnexB => super::h26x::ANNEX_B_START_CODE,
+                };
+                data.extend_from_slice(&prefix);
+                data.extend_from_slice(param_nal);
+            }
+        }
+
+        // Write non-parameter-set NALs with the configured framing.
+        piece_idx = 0;
+        for nal in &self.nals {
+            let next_piece_idx = crate::to_usize(nal.next_piece_idx);
+            let nal_pieces = &self.pieces[piece_idx..next_piece_idx];
+            if !matches!(
+                nal.hdr.nal_unit_type(),
+                UnitType::SeqParameterSet | UnitType::PicParameterSet
+            ) {
+                let prefix = match self.frame_format.h26x_framing {
+                    Framing::FourByteLength => nal.len.to_be_bytes(),
+                    Framing::AnnexB => super::h26x::ANNEX_B_START_CODE,
+                };
+                data.extend_from_slice(&prefix);
+                data.push(nal.hdr.into());
+                let mut actual_len = 1;
+                for piece in nal_pieces {
+                    debug_assert!(!piece.is_empty());
+                    data.extend_from_slice(&piece[..]);
+                    actual_len += piece.len();
+                }
+                debug_assert_eq!(crate::to_usize(nal.len), actual_len);
+            }
+            piece_idx = next_piece_idx;
+        }
+        debug_assert_eq!(retained_len, data.len());
+        self.nals.clear();
+        self.pieces.clear();
+
         Ok(VideoFrame {
             has_new_parameters,
             loss: au.loss,
@@ -777,16 +878,19 @@ impl Depacketizer {
 
 /// Returns true if we allow the given NAL unit type to end an access unit.
 ///
-/// We specifically prohibit this for the SPS and PPS. Reolink cameras sometimes
+/// We specifically prohibit this for the SPS, PPS, and SEI. Some cameras
 /// incorrectly set the RTP marker bit and/or change the timestamp after these.
 fn can_end_au(nal_unit_type: UnitType) -> bool {
-    // H.264 section 7.4.1.2.3 Order of NAL units and coded pictures and
-    // association to access units says "Sequence parameter set NAL units or
-    // picture parameter set NAL units may be present in an access unit, but
-    // cannot follow the last VCL NAL unit of the primary coded picture within
-    // the access unit, as this condition would specify the start of a new
-    // access unit."
-    nal_unit_type != UnitType::SeqParameterSet && nal_unit_type != UnitType::PicParameterSet
+    // H.264 section 7.4.1.2.3 specifies that SPS, PPS, and SEI NAL units
+    // must precede the primary coded picture within an access unit. If any of
+    // these appear after the last VCL NAL unit, they signal the start of a
+    // new access unit rather than ending the current one. An access unit
+    // containing only these non-VCL NAL types (with no VCL NAL) is not a
+    // valid picture.
+    !matches!(
+        nal_unit_type,
+        UnitType::SeqParameterSet | UnitType::PicParameterSet | UnitType::SEI
+    )
 }
 
 impl AccessUnit {
@@ -855,7 +959,7 @@ fn validate_order(nals: &[Nal], errs: &mut String) {
 
 #[derive(Clone, Debug)]
 struct InternalParameters {
-    generic_parameters: super::VideoParameters,
+    generic_parameters: VideoParameters,
 
     /// The (single) SPS NAL.
     sps_nal: Bytes,
@@ -929,13 +1033,19 @@ impl InternalParameters {
         }
         let sps_nal = sps_nal.ok_or_else(|| "bad sprop-parameter-sets: no sps".to_string())?;
         let pps_nal = pps_nal.ok_or_else(|| "bad sprop-parameter-sets: no pps".to_string())?;
-        Self::parse_sps_and_pps(&sps_nal, &pps_nal, false)
+        Self::parse_sps_and_pps(
+            &sps_nal,
+            &pps_nal,
+            false,
+            super::h26x::Framing::FourByteLength,
+        )
     }
 
     fn parse_sps_and_pps(
         sps_nal: &[u8],
         pps_nal: &[u8],
         mut seen_extra_trailing_data: bool,
+        framing: super::h26x::Framing,
     ) -> Result<InternalParameters, String> {
         let sps_rbsp = h264_reader::rbsp::decode_nal(sps_nal).map_err(|_| "bad sps")?;
         if sps_rbsp.len() < 5 {
@@ -961,55 +1071,76 @@ impl InternalParameters {
             seen_extra_trailing_data = true;
         }
 
-        let pixel_dimensions = sps
-            .pixel_dimensions()
+        let all_pixel_dimensions = Self::all_pixel_dimensions(&sps)
             .map_err(|e| format!("SPS has invalid pixel dimensions: {e:?}"))?;
-        let e = |_| {
-            format!(
-                "SPS has invalid pixel dimensions: {}x{} is too large",
-                pixel_dimensions.0, pixel_dimensions.1
-            )
+
+        let (extra_data, sps_nal, pps_nal) = match framing {
+            super::h26x::Framing::FourByteLength => {
+                // Create the AVCDecoderConfiguration, ISO/IEC 14496-15 section 5.2.4.1.
+                // The beginning of the AVCDecoderConfiguration takes a few values from
+                // the SPS (ISO/IEC 14496-10 section 7.3.2.1.1).
+                let mut buf = BytesMut::with_capacity(11 + sps_nal.len() + pps_nal.len());
+                buf.put_u8(1); // configurationVersion
+                buf.extend(&sps_rbsp[0..=2]); // profile_idc . AVCProfileIndication
+                // ...misc bits... . profile_compatibility
+                // level_idc . AVCLevelIndication
+
+                // Hardcode lengthSizeMinusOne to 3, matching 4-byte lengths.
+                buf.put_u8(0xff);
+
+                // Only support one SPS and PPS.
+                // ffmpeg's ff_isom_write_avcc has the same limitation, so it's probably
+                // fine. This next byte is a reserved 0b111 + a 5-bit # of SPSs (1).
+                buf.put_u8(0xe1);
+                buf.extend(
+                    &u16::try_from(sps_nal.len())
+                        .map_err(|_| {
+                            format!("SPS NAL is {} bytes long; must fit in u16", sps_nal.len())
+                        })?
+                        .to_be_bytes()[..],
+                );
+                let sps_nal_start = buf.len();
+                buf.extend_from_slice(sps_nal);
+                let sps_nal_end = buf.len();
+                buf.put_u8(1); // # of PPSs.
+                buf.extend(
+                    &u16::try_from(pps_nal.len())
+                        .map_err(|_| {
+                            format!("PPS NAL is {} bytes long; must fit in u16", pps_nal.len())
+                        })?
+                        .to_be_bytes()[..],
+                );
+                let pps_nal_start = buf.len();
+                buf.extend_from_slice(pps_nal);
+                let pps_nal_end = buf.len();
+                assert_eq!(
+                    buf.len(),
+                    11 + (sps_nal_end - sps_nal_start) + (pps_nal_end - pps_nal_start)
+                );
+
+                let buf = buf.freeze();
+                let sps_nal = buf.slice(sps_nal_start..sps_nal_end);
+                let pps_nal = buf.slice(pps_nal_start..pps_nal_end);
+                (buf, sps_nal, pps_nal)
+            }
+            super::h26x::Framing::AnnexB => {
+                // Annex B: start code prefix + SPS + start code prefix + PPS.
+                let mut buf = BytesMut::with_capacity(8 + sps_nal.len() + pps_nal.len());
+                buf.extend_from_slice(&super::h26x::ANNEX_B_START_CODE);
+                let sps_nal_start = buf.len();
+                buf.extend_from_slice(sps_nal);
+                let sps_nal_end = buf.len();
+                buf.extend_from_slice(&super::h26x::ANNEX_B_START_CODE);
+                let pps_nal_start = buf.len();
+                buf.extend_from_slice(pps_nal);
+                let pps_nal_end = buf.len();
+
+                let buf = buf.freeze();
+                let sps_nal = buf.slice(sps_nal_start..sps_nal_end);
+                let pps_nal = buf.slice(pps_nal_start..pps_nal_end);
+                (buf, sps_nal, pps_nal)
+            }
         };
-        let pixel_dimensions = (
-            u16::try_from(pixel_dimensions.0).map_err(e)?,
-            u16::try_from(pixel_dimensions.1).map_err(e)?,
-        );
-
-        // Create the AVCDecoderConfiguration, ISO/IEC 14496-15 section 5.2.4.1.
-        // The beginning of the AVCDecoderConfiguration takes a few values from
-        // the SPS (ISO/IEC 14496-10 section 7.3.2.1.1).
-        let mut avc_decoder_config = BytesMut::with_capacity(11 + sps_nal.len() + pps_nal.len());
-        avc_decoder_config.put_u8(1); // configurationVersion
-        avc_decoder_config.extend(&sps_rbsp[0..=2]); // profile_idc . AVCProfileIndication
-        // ...misc bits... . profile_compatibility
-        // level_idc . AVCLevelIndication
-
-        // Hardcode lengthSizeMinusOne to 3, matching TransformSampleData's 4-byte
-        // lengths.
-        avc_decoder_config.put_u8(0xff);
-
-        // Only support one SPS and PPS.
-        // ffmpeg's ff_isom_write_avcc has the same limitation, so it's probably
-        // fine. This next byte is a reserved 0b111 + a 5-bit # of SPSs (1).
-        avc_decoder_config.put_u8(0xe1);
-        avc_decoder_config.extend(
-            &u16::try_from(sps_nal.len())
-                .map_err(|_| format!("SPS NAL is {} bytes long; must fit in u16", sps_nal.len()))?
-                .to_be_bytes()[..],
-        );
-        let sps_nal_start = avc_decoder_config.len();
-        avc_decoder_config.extend_from_slice(sps_nal);
-        let sps_nal_end = avc_decoder_config.len();
-        avc_decoder_config.put_u8(1); // # of PPSs.
-        avc_decoder_config.extend(
-            &u16::try_from(pps_nal.len())
-                .map_err(|_| format!("PPS NAL is {} bytes long; must fit in u16", pps_nal.len()))?
-                .to_be_bytes()[..],
-        );
-        let pps_nal_start = avc_decoder_config.len();
-        avc_decoder_config.extend_from_slice(pps_nal);
-        let pps_nal_end = avc_decoder_config.len();
-        assert_eq!(avc_decoder_config.len(), 11 + sps_nal.len() + pps_nal.len());
 
         let (pixel_aspect_ratio, frame_rate);
         match sps.vui_parameters {
@@ -1032,16 +1163,13 @@ impl InternalParameters {
                 frame_rate = None;
             }
         }
-        let avc_decoder_config = avc_decoder_config.freeze();
-        let sps_nal = avc_decoder_config.slice(sps_nal_start..sps_nal_end);
-        let pps_nal = avc_decoder_config.slice(pps_nal_start..pps_nal_end);
         Ok(InternalParameters {
-            generic_parameters: super::VideoParameters {
+            generic_parameters: VideoParameters {
                 rfc6381_codec,
-                pixel_dimensions,
+                all_pixel_dimensions,
                 pixel_aspect_ratio,
                 frame_rate,
-                extra_data: avc_decoder_config,
+                extra_data,
                 codec: super::VideoParametersCodec::H264 {
                     sps: sps_nal.clone(),
                     pps: pps_nal.clone(),
@@ -1051,6 +1179,101 @@ impl InternalParameters {
             pps_nal,
             seen_extra_trailing_data,
         })
+    }
+
+    // XXX: copy'n'pasted'n'modified from `h264-reader`.
+    fn all_pixel_dimensions(sps: &SeqParameterSet) -> Result<AllPixelDimensions, SpsError> {
+        let coded_width: u16 = sps
+            .pic_width_in_mbs_minus1
+            .checked_add(1)
+            .and_then(|w| w.checked_mul(16))
+            .and_then(|w| w.try_into().ok())
+            .ok_or(SpsError::FieldValueTooLarge {
+                name: "pic_width_in_mbs_minus1",
+                value: sps.pic_width_in_mbs_minus1,
+            })?;
+        use h264_reader::nal::sps::{ChromaFormat, FrameMbsFlags};
+        let mul = match sps.frame_mbs_flags {
+            FrameMbsFlags::Fields { .. } => 2,
+            FrameMbsFlags::Frames => 1,
+        };
+        let vsub = if sps.chroma_info.chroma_format == ChromaFormat::YUV420 {
+            1
+        } else {
+            0
+        };
+        let hsub = if sps.chroma_info.chroma_format == ChromaFormat::YUV420
+            || sps.chroma_info.chroma_format == ChromaFormat::YUV422
+        {
+            1
+        } else {
+            0
+        };
+
+        let step_x = 1 << hsub;
+        let step_y = mul << vsub;
+
+        let coded_height: u16 = (sps.pic_height_in_map_units_minus1 + 1)
+            .checked_mul(mul * 16)
+            .and_then(|h| h.try_into().ok())
+            .ok_or(SpsError::FieldValueTooLarge {
+                name: "pic_height_in_map_units_minus1",
+                value: sps.pic_height_in_map_units_minus1,
+            })?;
+        let coded = (coded_width, coded_height);
+        if let Some(ref crop) = sps.frame_cropping {
+            let left_offset = crop
+                .left_offset
+                .checked_mul(step_x)
+                .and_then(|o| o.try_into().ok())
+                .ok_or(SpsError::FieldValueTooLarge {
+                    name: "left_offset",
+                    value: crop.left_offset,
+                })?;
+            let right_offset = crop
+                .right_offset
+                .checked_mul(step_x)
+                .and_then(|o| o.try_into().ok())
+                .ok_or(SpsError::FieldValueTooLarge {
+                    name: "right_offset",
+                    value: crop.right_offset,
+                })?;
+            let top_offset = crop
+                .top_offset
+                .checked_mul(step_y)
+                .and_then(|o| o.try_into().ok())
+                .ok_or(SpsError::FieldValueTooLarge {
+                    name: "top_offset",
+                    value: crop.top_offset,
+                })?;
+            let bottom_offset = crop
+                .bottom_offset
+                .checked_mul(step_y)
+                .and_then(|o| o.try_into().ok())
+                .ok_or(SpsError::FieldValueTooLarge {
+                    name: "bottom_offset",
+                    value: crop.bottom_offset,
+                })?;
+            let display_width = coded_width
+                .checked_sub(left_offset)
+                .and_then(|w| w.checked_sub(right_offset));
+            let display_height = coded_height
+                .checked_sub(top_offset)
+                .and_then(|w| w.checked_sub(bottom_offset));
+            if let (Some(display_width), Some(display_height)) = (display_width, display_height) {
+                Ok(AllPixelDimensions {
+                    display: (display_width, display_height),
+                    coded,
+                })
+            } else {
+                Err(SpsError::CroppingError(crop.clone()))
+            }
+        } else {
+            Ok(AllPixelDimensions {
+                display: coded,
+                coded,
+            })
+        }
     }
 }
 
@@ -1364,6 +1587,10 @@ mod tests {
     fn depacketize() {
         init_logging();
         let mut d = super::Depacketizer::new(90_000, Some("packetization-mode=1;profile-level-id=64001E;sprop-parameter-sets=Z2QAHqwsaoLA9puCgIKgAAADACAAAAMD0IAA,aO4xshsA")).unwrap();
+        d.set_frame_format(crate::codec::FrameFormat {
+            parameter_set_insertion: crate::codec::ParameterSetInsertion::Never,
+            ..Default::default()
+        });
         let timestamp = crate::Timestamp {
             timestamp: 0,
             clock_rate: NonZeroU32::new(90_000).unwrap(),
@@ -1405,7 +1632,7 @@ mod tests {
         assert_eq!(d.pull(), None);
         d.push(
             ReceivedPacketBuilder {
-                // FU-A packet, start.
+                // FU-A packet (non-IDR slice, type 1), start.
                 ctx: crate::PacketContext::dummy(),
                 stream_id: 0,
                 timestamp,
@@ -1415,7 +1642,7 @@ mod tests {
                 mark: false,
                 payload_type: 0,
             }
-            .build(*b"\x7c\x86fu-a start, ")
+            .build(*b"\x7c\x81fu-a start, ")
             .unwrap(),
         )
         .unwrap();
@@ -1432,7 +1659,7 @@ mod tests {
                 mark: false,
                 payload_type: 0,
             }
-            .build(*b"\x7c\x06fu-a middle, ")
+            .build(*b"\x7c\x01fu-a middle, ")
             .unwrap(),
         )
         .unwrap();
@@ -1449,7 +1676,7 @@ mod tests {
                 mark: true,
                 payload_type: 0,
             }
-            .build(*b"\x7c\x46fu-a end")
+            .build(*b"\x7c\x41fu-a end")
             .unwrap(),
         )
         .unwrap();
@@ -1462,7 +1689,7 @@ mod tests {
             b"\x00\x00\x00\x06\x06plain\
                      \x00\x00\x00\x09\x06stap-a 1\
                      \x00\x00\x00\x09\x06stap-a 2\
-                     \x00\x00\x00\x22\x66fu-a start, fu-a middle, fu-a end"
+                     \x00\x00\x00\x22\x61fu-a start, fu-a middle, fu-a end"
         );
         assert!(!d.seen_inconsistent_fu_a_nal_hdr);
     }
@@ -1476,6 +1703,10 @@ mod tests {
     fn depacketize_reserved_bit_set() {
         init_logging();
         let mut d = super::Depacketizer::new(90_000, Some("packetization-mode=1;profile-level-id=64001E;sprop-parameter-sets=Z2QAHqwsaoLA9puCgIKgAAADACAAAAMD0IAA,aO4xshsA")).unwrap();
+        d.set_frame_format(crate::codec::FrameFormat {
+            parameter_set_insertion: crate::codec::ParameterSetInsertion::Never,
+            ..Default::default()
+        });
         let timestamp = crate::Timestamp {
             timestamp: 0,
             clock_rate: NonZeroU32::new(90_000).unwrap(),
@@ -1483,7 +1714,7 @@ mod tests {
         };
         d.push(
             ReceivedPacketBuilder {
-                // FU-A packet, start.
+                // FU-A packet (non-IDR slice, type 1, reserved bit set), start.
                 ctx: crate::PacketContext::dummy(),
                 stream_id: 0,
                 timestamp,
@@ -1493,7 +1724,7 @@ mod tests {
                 mark: false,
                 payload_type: 0,
             }
-            .build(*b"\x7c\xa6fu-a start, ")
+            .build(*b"\x7c\xa1fu-a start, ")
             .unwrap(),
         )
         .unwrap();
@@ -1510,7 +1741,7 @@ mod tests {
                 mark: false,
                 payload_type: 0,
             }
-            .build(*b"\x7c\x26fu-a middle, ")
+            .build(*b"\x7c\x21fu-a middle, ")
             .unwrap(),
         )
         .unwrap();
@@ -1527,7 +1758,7 @@ mod tests {
                 mark: true,
                 payload_type: 0,
             }
-            .build(*b"\x7c\x66fu-a end")
+            .build(*b"\x7c\x61fu-a end")
             .unwrap(),
         )
         .unwrap();
@@ -1537,7 +1768,7 @@ mod tests {
         };
         assert_eq_hex!(
             frame.data(),
-            b"\x00\x00\x00\x22\x66fu-a start, fu-a middle, fu-a end"
+            b"\x00\x00\x00\x22\x61fu-a start, fu-a middle, fu-a end"
         );
     }
 
@@ -1991,6 +2222,7 @@ mod tests {
         0x65, b'i', b'd', b'r', b' ', b's', b'l', b'i', 0x00, 0x00, b'c', b'e', 0x00,
     ];
 
+    // Expected frame data with inline SPS/PPS retained (default behavior).
     #[rustfmt::skip]
     static PREFIXED_NALS: [u8; 48] = [
         // SPS
@@ -2002,6 +2234,29 @@ mod tests {
         0x68, 0xee, 0x3c, 0xb0,
         // IDR slice
         0x00, 0x00, 0x00, 0x0c,
+        0x65, b'i', b'd', b'r', b' ', b's', b'l', b'i', 0x00, 0x00, b'c', b'e',
+    ];
+
+    // Expected frame data with inline SPS/PPS stripped (MP4 mode).
+    #[rustfmt::skip]
+    static PREFIXED_NALS_STRIPPED: [u8; 16] = [
+        // IDR slice
+        0x00, 0x00, 0x00, 0x0c,
+        0x65, b'i', b'd', b'r', b' ', b's', b'l', b'i', 0x00, 0x00, b'c', b'e',
+    ];
+
+    // Expected frame data in SIMPLE mode (Annex B framing, SPS/PPS prepended on key frame).
+    #[rustfmt::skip]
+    static ANNEX_B_NALS_SIMPLE: [u8; 48] = [
+        // SPS
+        0x00, 0x00, 0x00, 0x01,
+        0x67, 0x64, 0x00, 0x33, 0xac, 0x15, 0x14, 0xa0, 0xa0, 0x3d, 0xa1,
+        0x00, 0x00, 0x04, 0xf6, 0x00, 0x00, 0x63, 0x38, 0x04,
+        // PPS
+        0x00, 0x00, 0x00, 0x01,
+        0x68, 0xee, 0x3c, 0xb0,
+        // IDR slice
+        0x00, 0x00, 0x00, 0x01,
         0x65, b'i', b'd', b'r', b' ', b's', b'l', b'i', 0x00, 0x00, b'c', b'e',
     ];
 
@@ -2143,6 +2398,167 @@ mod tests {
         }
     }
 
+    /// Like `parse_annex_b_single_nal` but with `strip_inline_parameters` enabled.
+    #[test]
+    fn parse_annex_b_single_nal_strip() {
+        init_logging();
+        let mut d =
+            super::Depacketizer::new(90_000, Some("packetization-mode=1;profile-level-id=640033"))
+                .unwrap();
+        d.set_frame_format(crate::codec::FrameFormat::MP4);
+        let timestamp = crate::Timestamp {
+            timestamp: 0,
+            clock_rate: NonZeroU32::new(90_000).unwrap(),
+            start: 0,
+        };
+        d.push(
+            ReceivedPacketBuilder {
+                ctx: crate::PacketContext::dummy(),
+                stream_id: 0,
+                timestamp,
+                ssrc: 0,
+                sequence_number: 0,
+                loss: 0,
+                mark: true,
+                payload_type: 0,
+            }
+            .build(ANNEX_B_NALS)
+            .unwrap(),
+        )
+        .unwrap();
+        let Some(Ok(CodecItem::VideoFrame(frame))) = d.pull() else {
+            panic!();
+        };
+        assert_eq_hex!(frame.data(), &PREFIXED_NALS_STRIPPED);
+    }
+
+    /// Like `parse_annex_b_fu_a` but with `strip_inline_parameters` enabled.
+    #[test]
+    fn parse_annex_b_fu_a_strip() {
+        init_logging();
+        for first_pkt_len in 2..ANNEX_B_NALS.len() - 1 {
+            for middle_pkt_len in [0, 1, 2, 3] {
+                if first_pkt_len + middle_pkt_len >= ANNEX_B_NALS.len() {
+                    continue;
+                }
+                let mut d = super::Depacketizer::new(
+                    90_000,
+                    Some("packetization-mode=1;profile-level-id=640033"),
+                )
+                .unwrap();
+                d.set_frame_format(crate::codec::FrameFormat::MP4);
+                let timestamp = crate::Timestamp {
+                    timestamp: 0,
+                    clock_rate: NonZeroU32::new(90_000).unwrap(),
+                    start: 0,
+                };
+                let mut first_pkt = Vec::with_capacity(first_pkt_len + 1);
+                first_pkt.push((ANNEX_B_NALS[0] & 0b1110_0000) | 28); // FU-A indicator
+                first_pkt.push((ANNEX_B_NALS[0] & 0b0001_1111) | 0b1000_0000); // start
+                first_pkt.extend_from_slice(&ANNEX_B_NALS[1..first_pkt_len]);
+                d.push(
+                    ReceivedPacketBuilder {
+                        ctx: crate::PacketContext::dummy(),
+                        stream_id: 0,
+                        timestamp,
+                        ssrc: 0,
+                        sequence_number: 0,
+                        loss: 0,
+                        mark: false,
+                        payload_type: 0,
+                    }
+                    .build(first_pkt)
+                    .unwrap(),
+                )
+                .unwrap();
+                assert_eq!(d.pull(), None);
+                if middle_pkt_len > 0 {
+                    let mut middle_pkt = Vec::with_capacity(middle_pkt_len + 2);
+                    middle_pkt.push((ANNEX_B_NALS[0] & 0b1110_0000) | 28); // FU-A indicator
+                    middle_pkt.push(ANNEX_B_NALS[0] & 0b0001_1111); // continuation
+                    middle_pkt.extend_from_slice(
+                        &ANNEX_B_NALS[first_pkt_len..first_pkt_len + middle_pkt_len],
+                    );
+                    d.push(
+                        ReceivedPacketBuilder {
+                            ctx: crate::PacketContext::dummy(),
+                            stream_id: 0,
+                            timestamp,
+                            ssrc: 0,
+                            sequence_number: 1,
+                            loss: 0,
+                            mark: false,
+                            payload_type: 0,
+                        }
+                        .build(middle_pkt)
+                        .unwrap(),
+                    )
+                    .unwrap();
+                    assert_eq!(d.pull(), None);
+                }
+                let mut last_pkt =
+                    Vec::with_capacity(ANNEX_B_NALS.len() - first_pkt_len - middle_pkt_len + 2);
+                last_pkt.push((ANNEX_B_NALS[0] & 0b1110_0000) | 28); // FU-A indicator
+                last_pkt.push((ANNEX_B_NALS[0] & 0b0001_1111) | 0b0100_0000); // end
+                last_pkt.extend_from_slice(&ANNEX_B_NALS[first_pkt_len + middle_pkt_len..]);
+                d.push(
+                    ReceivedPacketBuilder {
+                        ctx: crate::PacketContext::dummy(),
+                        stream_id: 0,
+                        timestamp,
+                        ssrc: 0,
+                        sequence_number: 2,
+                        loss: 0,
+                        mark: true,
+                        payload_type: 0,
+                    }
+                    .build(last_pkt)
+                    .unwrap(),
+                )
+                .unwrap();
+                let Some(Ok(CodecItem::VideoFrame(frame))) = d.pull() else {
+                    panic!();
+                };
+                assert_eq_hex!(frame.data(), &PREFIXED_NALS_STRIPPED);
+            }
+        }
+    }
+
+    /// Like `parse_annex_b_single_nal` but with `FrameFormat::SIMPLE` (Annex B framing,
+    /// parameter sets prepended on each key frame).
+    #[test]
+    fn parse_annex_b_single_nal_simple() {
+        init_logging();
+        let mut d =
+            super::Depacketizer::new(90_000, Some("packetization-mode=1;profile-level-id=640033"))
+                .unwrap();
+        d.set_frame_format(crate::codec::FrameFormat::SIMPLE);
+        let timestamp = crate::Timestamp {
+            timestamp: 0,
+            clock_rate: NonZeroU32::new(90_000).unwrap(),
+            start: 0,
+        };
+        d.push(
+            ReceivedPacketBuilder {
+                ctx: crate::PacketContext::dummy(),
+                stream_id: 0,
+                timestamp,
+                ssrc: 0,
+                sequence_number: 0,
+                loss: 0,
+                mark: true,
+                payload_type: 0,
+            }
+            .build(ANNEX_B_NALS)
+            .unwrap(),
+        )
+        .unwrap();
+        let Some(Ok(CodecItem::VideoFrame(frame))) = d.pull() else {
+            panic!();
+        };
+        assert_eq_hex!(frame.data(), &ANNEX_B_NALS_SIMPLE);
+    }
+
     #[test]
     fn allow_inconsistent_headers_between_fu_a() {
         init_logging();
@@ -2203,6 +2619,10 @@ mod tests {
     fn empty_fragment() {
         init_logging();
         let mut d = super::Depacketizer::new(90_000, Some("packetization-mode=1;profile-level-id=64001E;sprop-parameter-sets=Z2QAHqwsaoLA9puCgIKgAAADACAAAAMD0IAA,aO4xshsA")).unwrap();
+        d.set_frame_format(crate::codec::FrameFormat {
+            parameter_set_insertion: crate::codec::ParameterSetInsertion::Never,
+            ..Default::default()
+        });
         let timestamp = crate::Timestamp {
             timestamp: 0,
             clock_rate: NonZeroU32::new(90_000).unwrap(),
@@ -2210,7 +2630,7 @@ mod tests {
         };
         d.push(
             ReceivedPacketBuilder {
-                // FU-A packet, start (with data).
+                // FU-A packet (non-IDR slice, type 1), start (with data).
                 ctx: crate::PacketContext::dummy(),
                 stream_id: 0,
                 timestamp,
@@ -2220,7 +2640,7 @@ mod tests {
                 mark: false,
                 payload_type: 0,
             }
-            .build(*b"\x7c\x86start, ")
+            .build(*b"\x7c\x81start, ")
             .unwrap(),
         )
         .unwrap();
@@ -2237,7 +2657,7 @@ mod tests {
                 mark: false,
                 payload_type: 0,
             }
-            .build(*b"\x7c\x06")
+            .build(*b"\x7c\x01")
             .unwrap(),
         )
         .unwrap();
@@ -2254,7 +2674,7 @@ mod tests {
                 mark: true,
                 payload_type: 0,
             }
-            .build(*b"\x7c\x46end")
+            .build(*b"\x7c\x41end")
             .unwrap(),
         )
         .unwrap();
@@ -2262,7 +2682,7 @@ mod tests {
             Some(Ok(CodecItem::VideoFrame(frame))) => frame,
             _ => panic!(),
         };
-        assert_eq_hex!(frame.data(), b"\x00\x00\x00\x0b\x66start, end");
+        assert_eq_hex!(frame.data(), b"\x00\x00\x00\x0b\x61start, end");
     }
 
     /// Tests the `process_annex_b` function in isolation.
@@ -2353,7 +2773,7 @@ mod tests {
         };
         d.push(
             ReceivedPacketBuilder {
-                // plain SEI packet.
+                // plain non-IDR slice packet.
                 ctx: crate::PacketContext::dummy(),
                 stream_id: 0,
                 timestamp: timestamp1,
@@ -2363,7 +2783,7 @@ mod tests {
                 mark: true,
                 payload_type: 0,
             }
-            .build(*b"\x06plain")
+            .build(*b"\x01plain")
             .unwrap(),
         )
         .unwrap();
@@ -2377,7 +2797,124 @@ mod tests {
         let Some(Ok(CodecItem::VideoFrame(f))) = d.pull() else {
             panic!()
         };
-        assert_eq_hex!(f.data(), b"\x00\x00\x00\x06\x06plain");
+        assert_eq_hex!(f.data(), b"\x00\x00\x00\x06\x01plain");
+        assert_eq!(d.pull(), None);
+    }
+
+    /// Test that a SEI NAL with the mark bit set doesn't end an access unit.
+    ///
+    /// The LV-IP22IR40DVBL camera (and others using the same firmware, which
+    /// identifies itself as `H264DVR 1.0`) sends SPS, PPS, and SEI as
+    /// individual RTP packets each with the mark bit set, all at the same
+    /// timestamp as the following IDR slice. The SEI contains a single
+    /// reserved message (payload type 229). Per H.264 section 7.4.1.2.3,
+    /// SEI NAL units precede the primary coded picture, so they should not
+    /// end an access unit.
+    ///
+    /// See <https://github.com/scottlamb/moonfire-nvr/issues/352>.
+    #[test]
+    fn depacketize_sei_with_mark() {
+        init_logging();
+        let mut d = super::Depacketizer::new(
+            90_000,
+            Some(
+                "packetization-mode=1;profile-level-id=4d002a;\
+                  sprop-parameter-sets=Z00AKpWoHgCJ+WEAAAMAAQAAAwAyhA==,aO48gA==",
+            ),
+        )
+        .unwrap();
+        let timestamp = crate::Timestamp {
+            timestamp: 0,
+            clock_rate: NonZeroU32::new(90_000).unwrap(),
+            start: 0,
+        };
+
+        // SPS with (incorrect) mark.
+        d.push(
+            ReceivedPacketBuilder {
+                ctx: crate::PacketContext::dummy(),
+                stream_id: 0,
+                timestamp,
+                ssrc: 0,
+                sequence_number: 0,
+                loss: 0,
+                mark: true,
+                payload_type: 96,
+            }
+            .build(
+                *b"\x67\x4d\x00\x2a\x95\xa8\x1e\x00\x89\xf9\x61\
+                       \x00\x00\x03\x00\x01\x00\x00\x03\x00\x32\x84",
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(d.pull(), None);
+
+        // PPS with (incorrect) mark.
+        d.push(
+            ReceivedPacketBuilder {
+                ctx: crate::PacketContext::dummy(),
+                stream_id: 0,
+                timestamp,
+                ssrc: 0,
+                sequence_number: 1,
+                loss: 0,
+                mark: true,
+                payload_type: 96,
+            }
+            .build(*b"\x68\xee\x3c\x80")
+            .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(d.pull(), None);
+
+        // SEI (reserved payload type 229) with (incorrect) mark.
+        d.push(
+            ReceivedPacketBuilder {
+                ctx: crate::PacketContext::dummy(),
+                stream_id: 0,
+                timestamp,
+                ssrc: 0,
+                sequence_number: 2,
+                loss: 0,
+                mark: true,
+                payload_type: 96,
+            }
+            .build(*b"\x06\xe5\x01\xa7\x80")
+            .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(d.pull(), None);
+
+        // IDR slice with mark (correct this time).
+        d.push(
+            ReceivedPacketBuilder {
+                ctx: crate::PacketContext::dummy(),
+                stream_id: 0,
+                timestamp,
+                ssrc: 0,
+                sequence_number: 3,
+                loss: 0,
+                mark: true,
+                payload_type: 96,
+            }
+            .build(*b"\x65slice")
+            .unwrap(),
+        )
+        .unwrap();
+        let frame = match d.pull() {
+            Some(Ok(CodecItem::VideoFrame(frame))) => frame,
+            o => panic!("unexpected pull result {o:#?}"),
+        };
+        assert_eq_hex!(
+            frame.data(),
+            b"\x00\x00\x00\x16\x67\x4d\x00\x2a\x95\xa8\x1e\x00\x89\xf9\x61\
+              \x00\x00\x03\x00\x01\x00\x00\x03\x00\x32\x84\
+              \x00\x00\x00\x04\x68\xee\x3c\x80\
+              \x00\x00\x00\x05\x06\xe5\x01\xa7\x80\
+              \x00\x00\x00\x06\x65slice"
+        );
+        assert!(frame.is_random_access_point());
         assert_eq!(d.pull(), None);
     }
 }

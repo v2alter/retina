@@ -1,4 +1,4 @@
-// Copyright (C) 2026 Scott Lamb <slamb@slamb.org>
+// Copyright (C) The Retina Authors
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
 //! Serving a stream over a WebSocket for use with the WebCodecs API.
@@ -114,9 +114,9 @@ fn make_parameters_msg(parameters: &VideoParameters) -> axum::extract::ws::Messa
     out.put_u8(0);
     out.put_slice(parameters.rfc6381_codec().as_bytes());
     out.put_u8(0);
-    let (width, height) = parameters.pixel_dimensions();
-    out.put_u16(u16::try_from(width).unwrap_or(u16::MAX));
-    out.put_u16(u16::try_from(height).unwrap_or(u16::MAX));
+    let (coded_width, coded_height) = parameters.coded_pixel_dimensions();
+    out.put_u16(u16::try_from(coded_width).unwrap_or(u16::MAX));
+    out.put_u16(u16::try_from(coded_height).unwrap_or(u16::MAX));
     out.put_slice(parameters.extra_data());
     axum::extract::ws::Message::Binary(out.freeze())
 }
@@ -311,7 +311,10 @@ pub async fn run(opts: Opts) -> Result<(), Error> {
         bail!("No suitable video stream found");
     };
     session
-        .setup(video_stream_i, SetupOptions::default())
+        .setup(
+            video_stream_i,
+            SetupOptions::default().frame_format(retina::codec::FrameFormat::MP4),
+        )
         .await?;
     let session = session
         .play(retina::client::PlayOptions::default())

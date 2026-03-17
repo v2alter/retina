@@ -1,4 +1,4 @@
-// Copyright (C) 2023 Niclas Olmenius <niclas@voysys.se>
+// Copyright (C) The Retina Authors
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
 //! [JPEG](https://www.itu.int/rec/T-REC-T.81-199209-I/en)-encoded video.
@@ -19,7 +19,7 @@
 
 use bytes::{Buf, Bytes};
 
-use crate::{PacketContext, Timestamp, rtp::ReceivedPacket};
+use crate::{PacketContext, Timestamp, codec::AllPixelDimensions, rtp::ReceivedPacket};
 
 use super::{VideoFrame, VideoParameters};
 
@@ -446,7 +446,10 @@ impl Depacketizer {
                         start_ctx: ctx,
                         timestamp,
                         parameters: Some(VideoParameters {
-                            pixel_dimensions: (width, height),
+                            all_pixel_dimensions: AllPixelDimensions {
+                                coded: (width, height),
+                                display: (width, height),
+                            },
                             rfc6381_codec: "mp4v.6C".to_owned(),
                             pixel_aspect_ratio: None,
                             frame_rate: None,
