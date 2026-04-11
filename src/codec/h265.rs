@@ -57,6 +57,10 @@ pub(crate) struct Depacketizer {
     /// fragments.
     seen_inconsistent_fu_nal_hdr: bool,
 
+    /// True if we've seen a FU with both S and E bits set (a single-fragment
+    /// FU, forbidden by RFC 7798 section 4.4.3).
+    seen_single_fragment_fu: bool,
+
     /// Output format controlling NAL framing and parameter set insertion.
     frame_format: super::FrameFormat,
 }
@@ -152,6 +156,7 @@ impl Depacketizer {
             nals: Vec::new(),
             parameters,
             seen_inconsistent_fu_nal_hdr: false,
+            seen_single_fragment_fu: false,
             frame_format: Default::default(),
         })
     }
@@ -382,24 +387,33 @@ impl Depacketizer {
                 // Note: as only `tx-mode` `SRST` is supported, there is no DONL
                 // field to decode.
 
-                if start && end {
-                    return Err(format!("Invalid FU header {fu_header:02x}"));
-                }
                 if !end && mark {
                     return Err("FU pkt with MARK && !END".into());
                 }
                 let u32_len = u32::try_from(data.len())
                     .map_err(|_| "RTP packet len must be < u16::MAX".to_string())?;
-                match (start, access_unit.in_fu) {
+                let pieces = match (start, access_unit.in_fu) {
                     (true, true) => return Err("FU with start bit while frag in progress".into()),
                     (true, false) => {
-                        self.add_piece(data)?;
+                        if end && !self.seen_single_fragment_fu {
+                            // RFC 7798 section 4.4.3: "the Start bit and End bit MUST NOT both be
+                            // set to one in the same FU header". Some cameras violate this by
+                            // wrapping small NALs in a single-fragment FU.
+                            // Tolerate by treating them as a complete NAL.
+                            log::warn!(
+                                "FU header {fu_header:02x} has both start and end bits set; \
+                                 treating as a complete NAL. \
+                                 Will not log about this again for this stream."
+                            );
+                            self.seen_single_fragment_fu = true;
+                        }
+                        let pieces = self.add_piece(data)?;
                         self.nals.push(Nal {
                             hdr,
                             next_piece_idx: u32::MAX, // should be overwritten later.
                             len: 2 + u32_len,
                         });
-                        access_unit.in_fu = true;
+                        pieces
                     }
                     (false, true) => {
                         let pieces = self.add_piece(data)?;
@@ -417,12 +431,7 @@ impl Depacketizer {
                             self.seen_inconsistent_fu_nal_hdr = true;
                         }
                         nal.len += u32_len;
-                        if end {
-                            nal.next_piece_idx = pieces;
-                            access_unit.in_fu = false;
-                        } else if mark {
-                            return Err("FU has MARK and no END".into());
-                        }
+                        pieces
                     }
                     (false, false) => {
                         if loss > 0 {
@@ -436,7 +445,14 @@ impl Depacketizer {
                         }
                         return Err("FU has start bit unset while no frag in progress".into());
                     }
+                };
+                if end {
+                    self.nals
+                        .last_mut()
+                        .expect("both match arms reaching here ensure a last nal")
+                        .next_piece_idx = pieces;
                 }
+                access_unit.in_fu = !end;
             }
             _ => return Err(format!("unexpected/bad nal header {hdr:?}")),
         }
@@ -530,35 +546,32 @@ impl Depacketizer {
             let next_piece_idx = crate::to_usize(nal.next_piece_idx);
             let nal_pieces = &self.pieces[piece_idx..next_piece_idx];
             match nal.hdr.unit_type() {
-                nal::UnitType::VpsNut => {
+                nal::UnitType::VpsNut
                     if self
                         .parameters
                         .as_ref()
                         .map(|p| !nal_matches(&p.vps_nal[..], nal.hdr, nal_pieces))
-                        .unwrap_or(true)
-                    {
-                        new_vps = Some(to_bytes(nal.hdr, nal.len, nal_pieces));
-                    }
+                        .unwrap_or(true) =>
+                {
+                    new_vps = Some(to_bytes(nal.hdr, nal.len, nal_pieces));
                 }
-                nal::UnitType::SpsNut => {
+                nal::UnitType::SpsNut
                     if self
                         .parameters
                         .as_ref()
                         .map(|p| !nal_matches(&p.sps_nal[..], nal.hdr, nal_pieces))
-                        .unwrap_or(true)
-                    {
-                        new_sps = Some(to_bytes(nal.hdr, nal.len, nal_pieces));
-                    }
+                        .unwrap_or(true) =>
+                {
+                    new_sps = Some(to_bytes(nal.hdr, nal.len, nal_pieces));
                 }
-                nal::UnitType::PpsNut => {
+                nal::UnitType::PpsNut
                     if self
                         .parameters
                         .as_ref()
                         .map(|p| !nal_matches(&p.pps_nal[..], nal.hdr, nal_pieces))
-                        .unwrap_or(true)
-                    {
-                        new_pps = Some(to_bytes(nal.hdr, nal.len, nal_pieces));
-                    }
+                        .unwrap_or(true) =>
+                {
+                    new_pps = Some(to_bytes(nal.hdr, nal.len, nal_pieces));
                 }
                 u if matches!(
                     u.unit_type_class(),
@@ -1308,6 +1321,46 @@ mod tests {
         };
         assert_eq_hex!(frame.data(), b"\x00\x00\x00\x12\x28\x01fu start, fu end");
         assert!(d.seen_inconsistent_fu_nal_hdr);
+    }
+
+    /// Tests that a FU with both S and E bits set is treated as a complete NAL
+    /// rather than rejected. RFC 7798 section 4.4.3 forbids this, but some cameras
+    /// send it anyway for small NALs.
+    #[test]
+    fn single_fragment_fu() {
+        init_logging();
+        let mut d = super::Depacketizer::new(90_000, None).unwrap();
+        let timestamp = crate::Timestamp {
+            timestamp: 0,
+            clock_rate: NonZeroU32::new(90_000).unwrap(),
+            start: 0,
+        };
+        assert!(!d.seen_single_fragment_fu);
+        d.push(
+            ReceivedPacketBuilder {
+                // FU packet with S=1 E=1 FuType=1 (TRAIL_R) — header 0xc1,
+                // as observed in the wild.
+                ctx: PacketContext::dummy(),
+                stream_id: 0,
+                timestamp,
+                ssrc: 0,
+                sequence_number: 0,
+                loss: 0,
+                mark: true,
+                payload_type: 0,
+            }
+            .build(*b"\x62\x01\xc1small nal")
+            .unwrap(),
+        )
+        .unwrap();
+        assert!(d.seen_single_fragment_fu);
+        let frame = match d.pull() {
+            Some(Ok(CodecItem::VideoFrame(frame))) => frame,
+            o => panic!("unexpected pull result: {o:?}"),
+        };
+        // Reconstructed NAL: type=1 layer=0 TID=1 -> header \x02\x01, then payload.
+        // Length = 2 (header) + 9 (payload) = 11 = 0x0b.
+        assert_eq_hex!(frame.data(), b"\x00\x00\x00\x0b\x02\x01small nal");
     }
 
     /// Tests that empty FU fragments (no payload bytes after the FU header) are
