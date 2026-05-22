@@ -321,6 +321,20 @@ impl Depacketizer {
             panic!("push with data already pending: {p:?}");
         }
 
+        // Discard zero-NAL-type packets (NAL type 0 = Unspecified per RFC 6184).
+        // Some cameras send these spuriously. Discard early, before disturbing
+        // the state machine, so any in-progress access unit is unaffected.
+        if pkt.payload().first().map_or(false, |&b| b & 0b11111 == 0) {
+            if !self.seen_zero_nal_header {
+                log::warn!(
+                    "Discarding RTP packet with zero NAL unit type; \
+                     will not log about this again for this stream."
+                );
+                self.seen_zero_nal_header = true;
+            }
+            return Ok(());
+        }
+
         let mut access_unit =
             match std::mem::replace(&mut self.input_state, DepacketizerInputState::New) {
                 DepacketizerInputState::New => {
