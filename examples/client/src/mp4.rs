@@ -23,7 +23,7 @@ use clap::Parser;
 use futures::{Future, StreamExt};
 use log::{debug, info, warn};
 use retina::{
-    client::{SetupOptions, Transport},
+    client::{SetupOptions, Transport, SessionIdPolicy},
     codec::{AudioParameters, CodecItem, ParametersRef, VideoParameters},
 };
 
@@ -701,7 +701,7 @@ pub async fn run(opts: Opts) -> Result<(), Error> {
     let session_group = Arc::new(retina::client::SessionGroup::default());
     let mut session = retina::client::Session::describe(
         opts.src.url.clone(),
-        retina::client::SessionOptions::default()
+        retina::client::SessionOptions::default().session_id(SessionIdPolicy::UseFirst)
             .creds(creds)
             .session_group(session_group.clone())
             .user_agent("Retina mp4 example".to_owned())
