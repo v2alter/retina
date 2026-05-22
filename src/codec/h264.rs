@@ -110,6 +110,9 @@ pub(crate) struct Depacketizer {
     /// FU-A, forbidden by RFC 6184 section 5.8).
     seen_single_fragment_fu_a: bool,
 
+    /// True if we've already logged a warning about a zero NAL unit type.
+    seen_zero_nal_header: bool,
+
     /// Output format controlling NAL framing and parameter set insertion.
     frame_format: super::FrameFormat,
 }
@@ -262,6 +265,7 @@ impl Depacketizer {
             parameters,
             seen_inconsistent_fu_a_nal_hdr: false,
             seen_single_fragment_fu_a: false,
+            seen_zero_nal_header: false,
             frame_format: Default::default(),
         })
     }
